@@ -1792,11 +1792,23 @@ object Build {
       bspEnabled := enableBspAllProjects,
     )
 
-  private val sjsCompilerNodeFlags = List(
-    "--experimental-wasm-exnref",
-    "--experimental-wasm-jspi",
-    "--experimental-wasm-imported-strings",
-  )
+  /* Wasm feature flags needed to run the compiler's wasm output on Node.
+   * Newer Node/V8 versions ship these features by default and REMOVE the
+   * flags, making node error out with "bad option", so keep only the flags
+   * the node on PATH still accepts.
+   */
+  private lazy val sjsCompilerNodeFlags: List[String] = {
+    def nodeAccepts(flag: String): Boolean =
+      try {
+        val silent = scala.sys.process.ProcessLogger(_ => (), _ => ())
+        scala.sys.process.Process(Seq("node", flag, "-e", "0")).!(silent) == 0
+      } catch { case scala.util.control.NonFatal(_) => false }
+    List(
+      "--experimental-wasm-exnref",
+      "--experimental-wasm-jspi",
+      "--experimental-wasm-imported-strings",
+    ).filter(nodeAccepts)
+  }
 
   /* Configuration of the org.scala-lang:scala3-compiler_3:*.**.**-sjs project */
   lazy val sjsCompilerBrowserIDEExampleMacros = Project("sjsCompilerBrowserIDEExampleMacros", file("compiler/browser-ide/example-macros"))
