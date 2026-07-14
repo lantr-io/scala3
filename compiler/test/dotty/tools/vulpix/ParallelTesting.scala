@@ -590,7 +590,13 @@ trait ParallelTesting extends RunnerOrchestration with CoverageSupport:
                 NoSourcePosition,
               ) :: Nil
             reportedDiagnostics.foreach { diag =>
-              val context = (new ContextBase).initialCtx
+              val baseCtx = (new ContextBase).initialCtx
+              // Disable syntax highlighting: re-rendering the reconstructed diagnostic
+              // in this bare context would otherwise run the parser (via
+              // SyntaxHighlighting.highlight in MessageRendering.sourceLines), which
+              // needs an initialized Definitions and crashes on source such as
+              // `A with B` types.
+              val context = baseCtx.fresh.setSetting(baseCtx.settings.color, "never")
               reporter.report(diag)(using context)
             }
           case None => ()
@@ -637,7 +643,10 @@ trait ParallelTesting extends RunnerOrchestration with CoverageSupport:
             val columnNum = column.toInt
             val abstractFile = AbstractFile.getFile(filePath)
             val sourceFile = SourceFile(abstractFile, Codec.UTF8)
-            val offset = sourceFile.lineToOffset(lineNum - 1) + columnNum - 1
+            // Dotty renders columns 0-based (see MessageRendering.posFileStr), so a
+            // column-0 error must not subtract 1: doing so would move the offset onto
+            // the previous line and report the error on the wrong row.
+            val offset = sourceFile.lineToOffset(lineNum - 1) + math.max(0, columnNum - 1)
             val span = Spans.Span(offset)
             val sourcePos = SourcePosition(sourceFile, span)
             addToLast(barLine(start = false))
