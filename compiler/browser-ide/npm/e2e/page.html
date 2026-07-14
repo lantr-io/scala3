@@ -1,0 +1,85 @@
+<!--
+  End-to-end smoke test page for the scala3-compiler-sjs-browser package.
+  Served by run-e2e.mjs at /e2e.html; imports the package's public client.js
+  from the served package root, compiles + runs a trivial program in a Web
+  Worker, and POSTs the outcome back to /__result. Not shipped in the package.
+-->
+<meta charset="utf-8" />
+<title>scala3-compiler-sjs-browser e2e</title>
+<body>running</body>
+<script type="module">
+  import { createCompilerClient, isSupported } from "/client.js";
+
+  const RESULT_TIMEOUT_MS = 280000;
+  const log = [];
+  let reported = false;
+
+  function record(line) {
+    log.push(line);
+  }
+
+  async function report(result) {
+    if (reported) {
+      return;
+    }
+    reported = true;
+    document.body.textContent = result.ok ? "ok" : result.error ?? "failed";
+    try {
+      await fetch("/__result", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...result, log }),
+      });
+    } catch (_) {
+      // The harness also has a server-side timeout; nothing else we can do here.
+    }
+  }
+
+  // Page-side watchdog: if the flow hangs, still POST a failure with the log we
+  // collected so the harness prints something useful instead of hard-timing-out.
+  const watchdog = setTimeout(() => {
+    report({ ok: false, error: `page timed out after ${RESULT_TIMEOUT_MS / 1000}s` });
+  }, RESULT_TIMEOUT_MS);
+
+  const SOURCE = `object Main { def main(args: Array[String]): Unit = println("hello-from-e2e") }\n`;
+
+  try {
+    record(`isSupported=${isSupported()}`);
+    if (!isSupported()) {
+      throw new Error("WebAssembly JSPI (WebAssembly.Suspending) is unavailable in this browser.");
+    }
+
+    const client = createCompilerClient({
+      manifestUrl: "./dist/manifest.json",
+      onStatus: (text) => record(`status: ${text}`),
+      onAwaitingInput: (output) => record(`awaiting-input: ${JSON.stringify(output)}`),
+      onError: (message) => record(`error: ${message}`),
+    });
+
+    await client.ready;
+    record("ready");
+
+    const result = await client.run({
+      files: [{ path: "Main.scala", content: SOURCE }],
+    });
+    record(`run ok=${result.ok} compileDurationMs=${result.compileDurationMs}`);
+    record(`output=${JSON.stringify(result.output)}`);
+
+    if (result.ok !== true) {
+      throw new Error(`compilation/run failed:\n${result.output}`);
+    }
+    if (!result.output.includes("hello-from-e2e")) {
+      throw new Error(`unexpected program output: ${JSON.stringify(result.output)}`);
+    }
+
+    client.terminate();
+    clearTimeout(watchdog);
+    await report({ ok: true });
+  } catch (error) {
+    clearTimeout(watchdog);
+    await report({
+      ok: false,
+      error: error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error),
+    });
+  }
+</script>

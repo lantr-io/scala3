@@ -20,11 +20,11 @@ import scala.sys.process.{Process => SysProcess, ProcessLogger}
 import scala.util.control.NonFatal
 
 object SjsCompilerBrowserIDE {
-  private val CompilerJSImport = """import * as importedjszip from "jszip";"""
-  private val PatchedJSImport = """import * as importedjszip from "../vendor/jszip-wrapper.js";"""
-  private val CompilerWasmStreamingLoad =
+  val CompilerJSImport = """import * as importedjszip from "jszip";"""
+  val PatchedJSImport = """import * as importedjszip from "../vendor/jszip-wrapper.js";"""
+  val CompilerWasmStreamingLoad =
     """return await WebAssembly.instantiateStreaming(fetch(resolvedURL), importsObj, options);"""
-  private val CompilerWasmRobustLoad =
+  val CompilerWasmRobustLoad =
     """const response = await fetch(resolvedURL, { cache: "no-cache" });
       |    if (!response.ok) {
       |      throw new Error(`Failed to fetch ${resolvedURL}: ${response.status} ${response.statusText}`);
@@ -134,13 +134,14 @@ object SjsCompilerBrowserIDE {
     IO.write(
       assetsDir / "manifest.json",
       """{
-        |  "compilerModule": "./assets/compiler/main.js",
-        |  "compilerIR": "./assets/compiler/compiler-sjsir.zip",
-        |  "runtimeIR": "./assets/runtime/runtime-sjsir.zip",
+        |  "compilerModule": "./compiler/main.js",
+        |  "compilerIR": "./compiler/compiler-sjsir.zip",
+        |  "runtimeIR": "./runtime/runtime-sjsir.zip",
+        |  "jszipWrapper": "./vendor/jszip-wrapper.js",
         |  "classpath": [
-        |    { "path": "/lib/rt.jar", "url": "./assets/classpath/rt.jar" },
-        |    { "path": "/lib/scala-lib.jar", "url": "./assets/classpath/scala-lib.jar" },
-        |    { "path": "/lib/scalajs-lib.jar", "url": "./assets/classpath/scalajs-lib.jar" }
+        |    { "path": "/lib/rt.jar", "url": "./classpath/rt.jar" },
+        |    { "path": "/lib/scala-lib.jar", "url": "./classpath/scala-lib.jar" },
+        |    { "path": "/lib/scalajs-lib.jar", "url": "./classpath/scalajs-lib.jar" }
         |  ]
         |}
         |""".stripMargin,

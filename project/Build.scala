@@ -181,6 +181,7 @@ object Build {
   val sjsCompilerValidationTest = taskKey[Unit]("Run the minimal scala3-compiler-sjs CI validation test suite")
   val prepareBrowserIDE = taskKey[File]("Prepare the static browser IDE assets for scala3-compiler-sjs")
   val buildSEA = taskKey[File]("Build a self-contained Node SEA binary of scala3-compiler-sjs")
+  val packageBrowserBundle = taskKey[File]("Package the browser compiler bundle as an npm tarball")
 
   lazy val SourceDeps = config("sourcedeps")
 
@@ -2046,6 +2047,56 @@ object Build {
         distBinary.setExecutable(true, false)
         s.log.info(s"Copied SEA binary to $distBinary")
         distBinary
+      },
+      packageBrowserBundle := {
+        val s = streams.value
+        val outputDir = (Compile / fullLinkJS / scalaJSLinkerOutputDirectory).value
+        (Compile / fullLinkJS).value
+        val libsDir = bundleSjsCompilerLibs.value
+        (`scala-library-sjs` / Compile / compile).value
+        val scalaLibClasses = (`scala-library-sjs` / Compile / classDirectory).value
+        val report = (Compile / update).value
+        val scalaJSLibJar = report.select(
+          module = (_: ModuleID).name.startsWith("scalajs-library_")
+        ).headOption.getOrElse(sys.error("Could not find scalajs-library JAR"))
+        // Reuse the same staging dir as prepareBrowserIDE so the rt.jar
+        // extraction and the IR zips are shared and cached across both tasks.
+        val assetsDir = target.value / "browser-ide-assets"
+        val rtJar = assetsDir / "rt.jar"
+        val scalaLibJar = assetsDir / "scala-lib.jar"
+        val compilerIRZip = assetsDir / "compiler-sjsir.zip"
+        val runtimeIRZip = assetsDir / "runtime-sjsir.zip"
+        val jszipDist = baseDirectory.value / "node_modules" / "jszip" / "dist" / "jszip.js"
+
+        if (!rtJar.exists()) {
+          s.log.info(s"Extracting java.base from jrt:/ to $rtJar")
+          SjsCompilerBrowserIDE.extractRTJar(rtJar)
+        }
+
+        s.log.info(s"Packing runtime Scala.js IR into $runtimeIRZip")
+        SjsCompilerBrowserIDE.zipDirectory(libsDir / "sjsir", runtimeIRZip)
+        s.log.info(s"Packing compiler Scala.js IR into $compilerIRZip")
+        SjsCompilerBrowserIDE.zipIRClasspath((Compile / fullClasspath).value.map(_.data), compilerIRZip)
+        s.log.info(s"Packing Scala.js library classes into $scalaLibJar")
+        SjsCompilerBrowserIDE.zipDirectory(scalaLibClasses, scalaLibJar)
+
+        if (!jszipDist.exists())
+          sys.error("Missing Node dependency `jszip`. Run `cd compiler && npm install` before packaging the browser bundle.")
+
+        SjsCompilerBrowserBundle.build(
+          target.value / "browser-bundle",
+          outputDir,
+          baseDirectory.value / "browser-ide",
+          compilerIRZip,
+          runtimeIRZip,
+          rtJar,
+          scalaLibJar,
+          scalaJSLibJar,
+          jszipDist,
+          dottyVersion,
+          (ThisBuild / baseDirectory).value,
+          s.log,
+        )
       },
       // Configure to use the non-bootstrapped compiler
       bootstrappedScalaInstanceSettings,
