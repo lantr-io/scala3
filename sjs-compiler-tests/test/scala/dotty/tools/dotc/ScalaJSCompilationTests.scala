@@ -58,13 +58,40 @@ object ScalaJSCompilationTests extends ParallelTesting {
   @AfterClass def tearDown(): Unit =
     SjsCompilerBridge.shutdown()
     cleanup()
+    val skipped = skippedSeparateCompilationGroups.size
+    if skipped > 0 then
+      println(
+        s"Skipped $skipped separate-compilation test groups: " +
+        "JS backend emits only .sjsir; no .tasty/.class for later rounds")
     summaryReport.echoSummary()
 
   // Run tests -----------------------------------------------------------------
 
+  /** Test dirs skipped because they need more than one compilation round.
+   *  Deduplicated by title; reported once at teardown.
+   */
+  private val skippedSeparateCompilationGroups =
+    java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  /** The Scala.js-hosted compiler runs only GenSJSIR and never writes .tasty/.class
+   *  (those are produced by GenBCode, which is absent from the JS `PlatformBackendPhases`).
+   *  A later compilation round therefore cannot read the symbols an earlier round
+   *  produced, so any multi-round separate-compilation test fails with `Not Found`.
+   *  Detect these structurally (more than one compilation group) rather than by a
+   *  hardcoded list, so newly-added upstream tests are skipped automatically.
+   */
+  private def isMultiRoundSeparateCompilation(testSource: TestSource): Boolean =
+    testSource match
+      case source: SeparateCompilationSource if source.compilationGroups.sizeIs > 1 => true
+      case _ => false
+
   override protected def shouldSkipTestSource(testSource: TestSource): Boolean =
-    testSource.allToolArgs.get(ToolName.ScalaJS).exists(_.contains("--skip"))
-    || super.shouldSkipTestSource(testSource)
+    if isMultiRoundSeparateCompilation(testSource) then
+      skippedSeparateCompilationGroups.add(testSource.title)
+      true
+    else
+      testSource.allToolArgs.get(ToolName.ScalaJS).exists(_.contains("--skip"))
+      || super.shouldSkipTestSource(testSource)
 
   override protected def testPlatform: TestPlatform = TestPlatform.ScalaJS
 
