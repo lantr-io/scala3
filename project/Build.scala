@@ -180,6 +180,7 @@ object Build {
   val sjsCompilerCompilationTest = taskKey[Unit]("Run this codebase's Scala.js compilation tests")
   val sjsCompilerValidationTest = taskKey[Unit]("Run the minimal scala3-compiler-sjs CI validation test suite")
   val prepareBrowserIDE = taskKey[File]("Prepare the static browser IDE assets for scala3-compiler-sjs")
+  val buildSEA = taskKey[File]("Build a self-contained Node SEA binary of scala3-compiler-sjs")
 
   lazy val SourceDeps = config("sourcedeps")
 
@@ -2016,6 +2017,30 @@ object Build {
           jszipDist,
           s.log,
         )
+      },
+      buildSEA := {
+        val s = streams.value
+        val outputDir = (Compile / fullLinkJS / scalaJSLinkerOutputDirectory).value
+        (Compile / fullLinkJS).value
+        (`scala-library-sjs` / Compile / compile).value
+        val scalaLibClasses = (`scala-library-sjs` / Compile / classDirectory).value
+        val report = (Compile / update).value
+        val scalaJSLibJar = report.select(
+          module = (_: ModuleID).name.startsWith("scalajs-library_")
+        ).headOption.getOrElse(sys.error("Could not find scalajs-library JAR"))
+        val seaDir = target.value / "sea"
+        val classpathDir = seaDir / "classpath"
+        val rtJar = classpathDir / "rt.jar"
+        val scalaLibJar = classpathDir / "scala-lib.jar"
+        val jszipModuleDir = baseDirectory.value / "node_modules" / "jszip"
+
+        if (!rtJar.exists()) {
+          s.log.info(s"Extracting java.base from jrt:/ to $rtJar")
+          SjsCompilerBrowserIDE.extractRTJar(rtJar)
+        }
+        SjsCompilerBrowserIDE.zipDirectory(scalaLibClasses, scalaLibJar)
+
+        SjsCompilerSEA.build(seaDir, outputDir, rtJar, scalaLibJar, scalaJSLibJar, jszipModuleDir, s.log)
       },
       // Configure to use the non-bootstrapped compiler
       bootstrappedScalaInstanceSettings,
