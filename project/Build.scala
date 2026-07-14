@@ -2040,7 +2040,12 @@ object Build {
         }
         SjsCompilerBrowserIDE.zipDirectory(scalaLibClasses, scalaLibJar)
 
-        SjsCompilerSEA.build(seaDir, outputDir, rtJar, scalaLibJar, scalaJSLibJar, jszipModuleDir, s.log)
+        val binary = SjsCompilerSEA.build(seaDir, outputDir, rtJar, scalaLibJar, scalaJSLibJar, jszipModuleDir, s.log)
+        val distBinary = (ThisBuild / baseDirectory).value / "dist" / "scalac"
+        IO.copyFile(binary, distBinary)
+        distBinary.setExecutable(true, false)
+        s.log.info(s"Copied SEA binary to $distBinary")
+        distBinary
       },
       // Configure to use the non-bootstrapped compiler
       bootstrappedScalaInstanceSettings,
