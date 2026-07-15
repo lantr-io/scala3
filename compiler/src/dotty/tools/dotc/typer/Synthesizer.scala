@@ -523,16 +523,15 @@ class Synthesizer(typer: Typer)(using @constructorOnly c: Context):
           makeNamedTupleProductMirror(nameTypePairs)
         case MirrorSource.ClassSymbol(pre, cls) =>
           if cls.isGenericProduct then
-            platformDependent {
+            val _ = platformDependent[Unit]({
               if ctx.runZincPhases then
                 // The mirror should be resynthesized if the constructor of the
                 // case class `cls` changes. See `sbt-test/source-dependencies/mirror-product`.
                 val rec = ctx.compilationUnit.depRecorder
                 rec.addClassDependency(cls, xsbti.api.DependencyContext.DependencyByMemberRef)
                 rec.addUsedName(cls.primaryConstructor)
-            } {
               ()
-            }
+            })(())
             makeClassProductMirror(pre, cls, None)
           else withErrors(i"$cls is not a generic product because ${cls.whyNotGenericProduct}")
       case Left(msg) =>
@@ -555,16 +554,15 @@ class Synthesizer(typer: Typer)(using @constructorOnly c: Context):
     val clsIsGenericSum = cls.isGenericSum(pre)
 
     if acceptableMsg.isEmpty && clsIsGenericSum then
-      platformDependent {
+      val _ = platformDependent[Unit]({
         if ctx.runZincPhases then
           // The mirror should be resynthesized if any child of the sealed class
           // `cls` changes. See `sbt-test/source-dependencies/mirror-sum`.
           val rec = ctx.compilationUnit.depRecorder
           rec.addClassDependency(cls, xsbti.api.DependencyContext.DependencyByMemberRef)
           rec.addUsedName(cls, includeSealedChildren = true)
-      } {
         ()
-      }
+      })(())
 
       val elemLabels = cls.children.map(c => ConstantType(Constant(c.name.toString)))
 
