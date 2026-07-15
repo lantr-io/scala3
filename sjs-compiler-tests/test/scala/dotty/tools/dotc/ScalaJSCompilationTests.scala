@@ -63,6 +63,14 @@ object ScalaJSCompilationTests extends ParallelTesting {
       println(
         s"Skipped $skipped separate-compilation test groups: " +
         "JS backend emits only .sjsir; no .tasty/.class for later rounds")
+    val skippedMacros = skippedSameRunMacroTests.size
+    if skippedMacros > 0 then
+      println(
+        s"Skipped $skippedMacros same-run macro test(s): a macro defined and " +
+        "used in one compilation round needs a Scala.js linker to relink the " +
+        "freshly-emitted .sjsir on the fly, and the node batch harness has none " +
+        "(only the browser session does). Covered by the browser validation suite.\n" +
+        skippedSameRunMacroTests.asScala.toList.sorted.map("  " + _).mkString("\n"))
     summaryReport.echoSummary()
 
   // Run tests -----------------------------------------------------------------
@@ -71,6 +79,13 @@ object ScalaJSCompilationTests extends ParallelTesting {
    *  Deduplicated by title; reported once at teardown.
    */
   private val skippedSeparateCompilationGroups =
+    java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  /** Test dirs skipped because they define and use a macro in a single
+   *  compilation round (see [[processScalaSources]]). Deduplicated; reported
+   *  once at teardown.
+   */
+  private val skippedSameRunMacroTests =
     java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
 
   /** The Scala.js-hosted compiler runs only GenSJSIR and never writes .tasty/.class
@@ -103,10 +118,44 @@ object ScalaJSCompilationTests extends ParallelTesting {
       driver: Driver,
   ): Option[ScalaCompilerFailure] =
     if SjsCompilerBridge.isEnabled then
-      SjsCompilerBridge.process(args ++ sourcePaths).map { output =>
-        ScalaCompilerFailure(output, "scala3-compiler-sjs", Some(SjsCompilerBridge.checkOutputLines(output)))
-      }
+      SjsCompilerBridge.process(args ++ sourcePaths) match
+        case Some(result) if result.missingMacroEntryPoint =>
+          // A macro defined and used in the same compilation round can only be
+          // expanded by linking the macro's freshly-emitted .sjsir on the fly.
+          // That linker exists only in the browser session path
+          // (BrowserMacroLinkerRuntime installs globalThis.ScalaJSLinker); the
+          // node batch entry point (runScala3CompilerSJSAsync) has none, so the
+          // entry point is never registered and the compiler exits with the
+          // missing-macro-entry-point interrupt. Skip such tests rather than
+          // fail them, mirroring the multi-round separate-compilation skip.
+          // Same-run macros ARE exercised by the browser validation suite.
+          // Detection is scoped to that exact outcome (interrupt exit code plus
+          // the specific diagnostic), so a generic compile failure still fails.
+          // The compile step is shared with neg/pos runs; in the unlikely event
+          // this outcome ever arose there it becomes a skip (never a pass).
+          skippedSameRunMacroTests.add(sameRunMacroSkipLabel(sourcePaths))
+          reporter.setSkip()
+          None
+        case Some(result) if result.failed =>
+          Some(ScalaCompilerFailure(
+            result.output,
+            "scala3-compiler-sjs",
+            Some(SjsCompilerBridge.checkOutputLines(result.output)),
+          ))
+        case _ =>
+          None
     else super.processScalaSources(args, sourcePaths, targetDir, reporter, driver)
+
+  /** A short, stable label (e.g. `run/25333`) for a skipped same-run macro
+   *  test, derived from the directory holding its sources.
+   */
+  private def sameRunMacroSkipLabel(sourcePaths: Array[String]): String =
+    sourcePaths.headOption match
+      case Some(path) =>
+        val dir = new File(path).getParentFile
+        if dir == null then "<unknown>"
+        else Option(dir.getParentFile).fold(dir.getName)(parent => s"${parent.getName}/${dir.getName}")
+      case None => "<unknown>"
 
   override def runMain(classPath: String, toolArgs: ToolArgs)(implicit summaryReport: SummaryReporting): Status =
     import scala.concurrent.ExecutionContext.Implicits.global
@@ -132,16 +181,36 @@ private object SjsCompilerBridge:
   private val CompilerName = "scala3-compiler-sjs"
   private val Response = """\{"id":(\d+),"code":(-?\d+),"output":"([^"]*)"\}""".r
 
+  /** Exit code the Scala.js-hosted compiler returns when a macro entry point
+   *  could not be linked; see `MainJS.MissingMacroEntryPointExitCode`.
+   */
+  private val MissingMacroEntryPointExitCode = 125
+  /** Substring of the diagnostic emitted for that outcome
+   *  ("... entry point is not linked" / "... entry points are not linked").
+   */
+  private val MissingMacroEntryPointMarker = "Scala.js macro entry point"
+
   private val servers = mutable.LinkedHashSet.empty[CompilerServer]
   private val threadServer = ThreadLocal[CompilerServer]()
+
+  /** Outcome of one compiler invocation against the Scala.js-hosted compiler. */
+  final case class CompileResult(code: Int, output: String):
+    /** True when the compile ended with a nonzero exit code. */
+    def failed: Boolean = code != 0
+    /** True for the specific "same-run macro could not be linked" outcome:
+     *  the interrupt exit code together with its diagnostic. Keyed on both so a
+     *  generic compile failure is never mistaken for it.
+     */
+    def missingMacroEntryPoint: Boolean =
+      code == MissingMacroEntryPointExitCode && output.contains(MissingMacroEntryPointMarker)
 
   def isEnabled: Boolean =
     sys.props.contains(CompilerMainProperty)
 
-  def process(args: Array[String]): Option[String] =
-    sys.props.get(CompilerMainProperty).flatMap { compilerMain =>
+  def process(args: Array[String]): Option[CompileResult] =
+    sys.props.get(CompilerMainProperty).map { compilerMain =>
       val (code, output) = server(compilerMain).run(withExtraClasspath(args))
-      Option.when(code != 0)(output)
+      CompileResult(code, output)
     }
 
   def checkOutputLines(output: String): List[String] =
