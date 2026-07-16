@@ -74,7 +74,12 @@ object BrowserIDEWorker:
   private final case class SourceFile(path: String, sourcePath: String, content: String)
   private final case class Entrypoint(key: String, qualifiedName: String, kind: String)
   private final case class Selection(entrypoint: Option[Entrypoint] = None, error: Option[String] = None)
-  private final case class CompilerRun(exitCode: Int, lines: Seq[String], emittedFiles: Seq[String])
+  private final case class CompilerRun(
+      exitCode: Int,
+      lines: Seq[String],
+      emittedFiles: Seq[String],
+      diagnostics: Seq[js.Dynamic],
+  )
   private final case class CompileResult(
       ok: Boolean,
       exitCode: Int,
@@ -83,11 +88,26 @@ object BrowserIDEWorker:
       irFiles: Seq[BrowserLinkerBridge.IRInput],
       runtime: Runtime,
       hints: Seq[String],
+      diagnostics: Seq[js.Dynamic],
       timings: mutable.Map[String, Double],
   )
-  private final case class LinkedSession(moduleURL: String, runner: js.Function1[String, js.Dynamic], input: String = "")
+  // Result of a compile-only operation (no entrypoint discovery / linking / execution).
+  private final case class CompileOnlyResult(
+      ok: Boolean,
+      exitCode: Int,
+      diagnostics: Seq[js.Dynamic],
+      lines: Seq[String],
+      durationMs: Double,
+      timings: mutable.Map[String, Double],
+  )
+  private final case class LinkedSession(
+      moduleURL: String,
+      runner: js.Function1[String, js.Dynamic],
+      diagnostics: Seq[js.Dynamic] = Nil,
+      input: String = "",
+  )
   private enum LinkedSessionResult:
-    case Failed(output: String)
+    case Failed(output: String, diagnostics: Seq[js.Dynamic])
     case Ready(session: LinkedSession)
 
   private final case class SessionResult(status: RunStatus, output: String)
@@ -119,6 +139,15 @@ object BrowserIDEWorker:
             val files = data.selectDynamic("files")
             startRun(
               if js.Array.isArray(files) then files.asInstanceOf[js.Array[js.Dynamic]] else js.Array(),
+              scalacOptionsOf(data.selectDynamic("scalacOptions")),
+              booleanOrFalse(data.selectDynamic("diagnostics")),
+            )
+          case "compile" =>
+            post("status", "text" -> "Compiling...")
+            val files = data.selectDynamic("files")
+            startCompile(
+              if js.Array.isArray(files) then files.asInstanceOf[js.Array[js.Dynamic]] else js.Array(),
+              scalacOptionsOf(data.selectDynamic("scalacOptions")),
               booleanOrFalse(data.selectDynamic("diagnostics")),
             )
           case "stdin" =>
@@ -264,6 +293,7 @@ object BrowserIDEWorker:
         sourcePaths: Seq[String],
         macroArtifacts: Seq[js.Dynamic],
         timings: mutable.Map[String, Double],
+        scalacOptions: Seq[String],
         diagnostics: Boolean,
     ): js.Promise[CompilerRun] =
       js.async {
@@ -274,7 +304,10 @@ object BrowserIDEWorker:
         refreshBrowserMacroArtifacts(runtime)
 
         try
-          val setupArgs = (Seq(
+          // User options come first; the managed -classpath/-d (and the optional
+          // diagnostics flags) come after so dotc's last-wins parsing lets the
+          // worker-managed values win on conflict.
+          val setupArgs = (scalacOptions ++ Seq(
             "-classpath",
             classpathArgument(runtime),
             "-d",
@@ -287,21 +320,23 @@ object BrowserIDEWorker:
             (name: String, durationMs: Double) => recordTiming(Some(timings), name, durationMs)
           val compile =
             if hasMacroArtifacts then
-              MainJS.runBrowserSessionWithRetainedMacroCompilerAndPhaseTimingAsync(setupArgs, sourcePaths.toJSArray, recordPhaseTiming)
+              MainJS.compileBrowserSessionWithRetainedMacroCompilerStructuredAsync(setupArgs, sourcePaths.toJSArray, recordPhaseTiming)
             else
-              MainJS.runBrowserSessionWithPhaseTimingAsync(setupArgs, sourcePaths.toJSArray, recordPhaseTiming)
+              MainJS.compileBrowserSessionStructuredAsync(setupArgs, sourcePaths.toJSArray, recordPhaseTiming)
           val captured = js.await(captureConsole(compile))
+          val structured = captured.result
           CompilerRun(
-            exitCode = captured.result,
+            exitCode = exitCodeOf(structured),
             lines = captured.lines,
             emittedFiles = filesAt(runtime.fs, OutputDir),
+            diagnostics = mapDiagnostics(structured),
           )
         finally
           runtime.activeTimings = previousTimings
           recordTiming(Some(timings), "compile", nowMs() - compileStartedAt)
       }
 
-    private def compileToIR(sourceOrFiles: js.Any, diagnostics: Boolean): js.Promise[CompileResult] =
+    private def compileToIR(sourceOrFiles: js.Any, scalacOptions: Seq[String], diagnostics: Boolean): js.Promise[CompileResult] =
       js.async {
         val timings = mutable.LinkedHashMap.empty[String, Double]
         val runtime = js.await(ensureRuntime())
@@ -317,7 +352,7 @@ object BrowserIDEWorker:
         retainMacroModulesForCurrentSources(runtime, sourceFiles)
 
         def timedRunCompiler(paths: Seq[String]): CompilerRun =
-          js.await(runCompiler(runtime, paths, macroArtifacts, timings, diagnostics))
+          js.await(runCompiler(runtime, paths, macroArtifacts, timings, scalacOptions, diagnostics))
 
         selectSourceEntrypoint(sourceFiles) match
           case Some(Selection(Some(entrypoint), _)) =>
@@ -339,18 +374,46 @@ object BrowserIDEWorker:
                   val finalCompile = timedRunCompiler(sourcePaths :+ RunnerSourcePath)
                   compileResult(finalCompile, runtime, timings)
                 case Selection(_, Some(error)) =>
-                  CompileResult(false, 0, Seq(error), discoveryCompile.emittedFiles, Nil, runtime, Nil, timings)
+                  CompileResult(false, 0, Seq(error), discoveryCompile.emittedFiles, Nil, runtime, Nil, discoveryCompile.diagnostics, timings)
                 case _ =>
-                  CompileResult(false, 0, Seq("No runnable entry point was found."), Nil, Nil, runtime, Nil, timings)
+                  CompileResult(false, 0, Seq("No runnable entry point was found."), Nil, Nil, runtime, Nil, discoveryCompile.diagnostics, timings)
       }
 
-    private def createLinkedSession(sourceOrFiles: js.Any, diagnostics: Boolean): js.Promise[LinkedSessionResult] =
+    private def compileSources(sourceOrFiles: js.Any, scalacOptions: Seq[String], diagnostics: Boolean): js.Promise[CompileOnlyResult] =
       js.async {
         val startedAt = nowMs()
-        val compileResult = js.await(compileToIR(sourceOrFiles, diagnostics))
+        val timings = mutable.LinkedHashMap.empty[String, Double]
+        val runtime = js.await(ensureRuntime())
+        val sourceFiles = normalizeSourceFiles(sourceOrFiles)
+        val sourcePaths = sourceFiles.map(_.sourcePath)
+        val macroArtifacts = dynamicMacroArtifacts(sourceFiles)
+
+        runtime.fs.removeTree("/workspace")
+        runtime.fs.mkdir("/workspace")
+        runtime.fs.mkdir(OutputDir)
+        writeSourceFiles(runtime.fs, sourceFiles)
+
+        retainMacroModulesForCurrentSources(runtime, sourceFiles)
+
+        // Compile only: no entrypoint discovery, no generated runner, no linking or execution.
+        val compile = js.await(runCompiler(runtime, sourcePaths, macroArtifacts, timings, scalacOptions, diagnostics))
+        CompileOnlyResult(
+          ok = compile.exitCode == 0,
+          exitCode = compile.exitCode,
+          diagnostics = compile.diagnostics,
+          lines = userVisibleCompilerLog(compile),
+          durationMs = math.max(0.0, nowMs() - startedAt),
+          timings = timings,
+        )
+      }
+
+    private def createLinkedSession(sourceOrFiles: js.Any, scalacOptions: Seq[String], diagnostics: Boolean): js.Promise[LinkedSessionResult] =
+      js.async {
+        val startedAt = nowMs()
+        val compileResult = js.await(compileToIR(sourceOrFiles, scalacOptions, diagnostics))
         if !compileResult.ok then
           postCompileDuration(startedAt, compileResult)
-          LinkedSessionResult.Failed(summarizeCompileFailure(compileResult))
+          LinkedSessionResult.Failed(summarizeCompileFailure(compileResult), compileResult.diagnostics)
         else
           post("status", "text" -> "Linking...")
           val runtimeIR = js.await(measureTiming(compileResult.timings, "runtime IR")(ensureExecutionRuntime(compileResult.runtime)))
@@ -362,52 +425,83 @@ object BrowserIDEWorker:
           LinkedSessionResult.Ready(LinkedSession(
             linkedRunner.selectDynamic("moduleURL").toString,
             linkedRunner.selectDynamic("runner").asInstanceOf[js.Function1[String, js.Dynamic]],
+            diagnostics = compileResult.diagnostics,
           ))
       }
 
     private def postCompileDuration(startedAt: Double, compileResult: CompileResult): Unit =
       post("compile-duration",
         "durationMs" -> math.max(0.0, nowMs() - startedAt),
-        "phases" -> compileResult.timings.collect {
-          case (name, durationMs) if durationMs >= 0.5 =>
-            js.Dynamic.literal(name = name, durationMs = durationMs)
-        }.toJSArray,
+        "phases" -> phaseTimingsArray(compileResult.timings),
         "compilerLog" -> compileResult.lines.toJSArray,
       )
 
-    private def startRun(sourceOrFiles: js.Any, diagnostics: Boolean): Unit =
+    private def phaseTimingsArray(timings: mutable.Map[String, Double]): js.Array[js.Dynamic] =
+      timings.collect {
+        case (name, durationMs) if durationMs >= 0.5 =>
+          js.Dynamic.literal(name = name, durationMs = durationMs)
+      }.toJSArray
+
+    private def startCompile(sourceOrFiles: js.Any, scalacOptions: Seq[String], diagnostics: Boolean): Unit =
+      onComplete(compileSources(sourceOrFiles, scalacOptions, diagnostics))(
+        result =>
+          // Success path omits `error`; the client resolves the compile promise.
+          post("compile-result",
+            "ok" -> result.ok,
+            "exitCode" -> result.exitCode,
+            "diagnostics" -> result.diagnostics.toJSArray,
+            "compilerLog" -> result.lines.toJSArray,
+            "durationMs" -> result.durationMs,
+            "phases" -> phaseTimingsArray(result.timings),
+          ),
+        error =>
+          // Invalid requests (duplicate/`..`/non-.scala paths) and other pre-compile
+          // failures reject the compile promise via the `error` field, rather than a
+          // session-fatal runtime-error. Compile errors themselves take the success path.
+          post("compile-result",
+            "ok" -> false,
+            "exitCode" -> 1,
+            "error" -> formatErrorForUser(error),
+            "diagnostics" -> js.Array[js.Dynamic](),
+            "compilerLog" -> js.Array[String](),
+            "durationMs" -> 0.0,
+            "phases" -> js.Array[js.Dynamic](),
+          ),
+      )
+
+    private def startRun(sourceOrFiles: js.Any, scalacOptions: Seq[String], diagnostics: Boolean): Unit =
       onComplete(js.async {
         disposeActiveSession()
-        val sessionResult = js.await(createLinkedSession(sourceOrFiles, diagnostics))
+        val sessionResult = js.await(createLinkedSession(sourceOrFiles, scalacOptions, diagnostics))
         sessionResult match
-          case LinkedSessionResult.Failed(output) =>
-            post("run-result", "ok" -> false, "output" -> output)
+          case LinkedSessionResult.Failed(output, failureDiagnostics) =>
+            post("run-result", "ok" -> false, "output" -> output, "diagnostics" -> failureDiagnostics.toJSArray)
           case LinkedSessionResult.Ready(session) =>
             activeSession = Some(session)
             post("status", "text" -> "Running...")
-            postSessionResult(executeSession(session))
+            postSessionResult(executeSession(session), session.diagnostics)
       })(
         _ => (),
         error =>
           disposeActiveSession()
-          post("run-result", "ok" -> false, "output" -> formatErrorForUser(error)),
+          post("run-result", "ok" -> false, "output" -> formatErrorForUser(error), "diagnostics" -> js.Array[js.Dynamic]()),
       )
 
     private def continueRun(line: String): Unit =
       activeSession match
         case None =>
-          post("run-result", "ok" -> false, "output" -> "No running program is waiting for input.")
+          post("run-result", "ok" -> false, "output" -> "No running program is waiting for input.", "diagnostics" -> js.Array[js.Dynamic]())
         case Some(session) =>
           val nextSession = session.copy(input = session.input + s"$line\n")
           activeSession = Some(nextSession)
           onComplete(js.async {
             post("status", "text" -> "Running...")
-            postSessionResult(executeSession(nextSession))
+            postSessionResult(executeSession(nextSession), nextSession.diagnostics)
           })(
             _ => (),
             error =>
               disposeActiveSession()
-              post("run-result", "ok" -> false, "output" -> formatErrorForUser(error)),
+              post("run-result", "ok" -> false, "output" -> formatErrorForUser(error), "diagnostics" -> js.Array[js.Dynamic]()),
           )
 
     private def executeSession(session: LinkedSession): SessionResult =
@@ -420,13 +514,13 @@ object BrowserIDEWorker:
         output = runnerOutput,
       )
 
-    private def postSessionResult(sessionResult: SessionResult): Unit =
+    private def postSessionResult(sessionResult: SessionResult, diagnostics: Seq[js.Dynamic]): Unit =
       sessionResult.status match
         case RunStatus.AwaitingInput =>
           post("awaiting-input", "output" -> sessionResult.output)
         case RunStatus.Completed =>
           disposeActiveSession()
-          post("run-result", "ok" -> true, "output" -> sessionResult.output)
+          post("run-result", "ok" -> true, "output" -> sessionResult.output, "diagnostics" -> diagnostics.toJSArray)
 
     private def loadLinkedRunner(jsCode: String): js.Promise[js.Dynamic] =
       js.async {
@@ -457,6 +551,7 @@ object BrowserIDEWorker:
         irFiles = if compile.exitCode == 0 then collectOutputIRFiles(runtime.fs, OutputDir) else Nil,
         runtime = runtime,
         hints = compileHints(visibleLines),
+        diagnostics = compile.diagnostics,
         timings = timings,
       )
 
@@ -745,6 +840,57 @@ object BrowserIDERunner:
 
     private def booleanOrFalse(value: js.Any): Boolean =
       isDefined(value) && js.typeOf(value) == "boolean" && value.asInstanceOf[Boolean]
+
+    // Accept only an array of non-empty strings; any other shape (or non-string /
+    // empty element) is ignored so a malformed value cannot break argument parsing.
+    private def scalacOptionsOf(value: js.Any): Seq[String] =
+      if js.Array.isArray(value) then
+        value.asInstanceOf[js.Array[js.Any]].toSeq.collect {
+          case option if js.typeOf(option) == "string" && option.asInstanceOf[String].nonEmpty =>
+            option.asInstanceOf[String]
+        }
+      else Nil
+
+    private def exitCodeOf(result: js.Dynamic): Int =
+      val code = result.selectDynamic("exitCode")
+      if js.typeOf(code) == "number" then code.asInstanceOf[Double].toInt
+      else if booleanOrFalse(result.selectDynamic("hasErrors")) then 1
+      else 0
+
+    // Turn the compiler-side structured result into page-facing diagnostics:
+    // drop info-level noise, remap virtual source paths, and rebuild each entry as
+    // a plain (structured-clone-safe) object rather than mutating the compiler's.
+    private def mapDiagnostics(result: js.Dynamic): Seq[js.Dynamic] =
+      dynamicArray(result.selectDynamic("diagnostics"))
+        .filterNot(diag => stringOr(diag.selectDynamic("severity"), "") == "info")
+        .map(mapDiagnostic)
+
+    private def mapDiagnostic(diag: js.Dynamic): js.Dynamic =
+      js.Dynamic.literal(
+        severity = diag.selectDynamic("severity"),
+        message = diag.selectDynamic("message"),
+        rendered = diag.selectDynamic("rendered"),
+        file = mapDiagnosticFile(diag.selectDynamic("file")),
+        line = diag.selectDynamic("line"),
+        column = diag.selectDynamic("column"),
+        endLine = diag.selectDynamic("endLine"),
+        endColumn = diag.selectDynamic("endColumn"),
+        offset = diag.selectDynamic("offset"),
+        endOffset = diag.selectDynamic("endOffset"),
+        code = diag.selectDynamic("code"),
+        name = diag.selectDynamic("name"),
+      )
+
+    // Map compiler file paths back to what the caller passed: workspace sources lose
+    // the virtual prefix, the generated runner becomes null, everything else (incl.
+    // null) is left as-is.
+    private def mapDiagnosticFile(file: js.Any): js.Any =
+      if js.typeOf(file) != "string" then file
+      else
+        val path = file.asInstanceOf[String]
+        if path == RunnerSourcePath then null.asInstanceOf[js.Any]
+        else if path.startsWith(s"$SourceRoot/") then path.stripPrefix(s"$SourceRoot/")
+        else path
 
     private def formatValue(value: js.Any): String =
       stripAnsi(if js.typeOf(value) == "string" then value.toString else js.JSON.stringify(value).toString)

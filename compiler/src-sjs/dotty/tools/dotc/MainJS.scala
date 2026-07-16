@@ -26,7 +26,27 @@ object MainJS extends JSDriver:
   private val DefaultMaxMacroLinkRestarts = 8
   private val MaxBrowserCompilerSessions = 4
   private val MacroSessionExport = "runScala3SjsMacroSessionAsync"
+  private val StructuredMacroSessionExport = "runScala3SjsMacroSessionStructuredAsync"
   private val PublicModuleUrlsGlobalName = "__scala3CompilerSJSPublicModuleUrls"
+
+  private type MacroSessionFn = js.Function5[
+    js.Array[String],
+    js.Array[String],
+    js.Function1[js.Dynamic, js.Any],
+    Int,
+    js.Function2[String, Double, Unit],
+    js.Promise[Int],
+  ]
+
+  private type StructuredMacroSessionFn = js.Function6[
+    js.Array[String],
+    js.Array[String],
+    js.Function1[js.Dynamic, js.Any],
+    Int,
+    js.Function2[String, Double, Unit],
+    js.Function1[js.Any, Unit],
+    js.Promise[Int],
+  ]
   private val importedModuleNamespaces = mutable.LinkedHashMap.empty[String, js.Dynamic]
   private val browserCompilerSessions = mutable.LinkedHashMap.empty[String, BrowserCompilerSession]
   private var lastMissingMacroEntryPointsOrNull: MissingMacroEntryPointException | Null = null
@@ -75,6 +95,41 @@ object MainJS extends JSDriver:
           recordPhaseTiming,
         )
 
+  /** Structured, single-shot browser compile (no macro relinking). Resolves to a compile
+   *  result object; never rejects on compile errors.
+   */
+  def compileBrowserSessionStructuredAsync(
+      setupArgs: js.Array[String],
+      sourcePaths: js.Array[String],
+      recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
+  ): js.Promise[js.Dynamic] =
+    js.async {
+      compileBrowserSessionStructuredImpl(setupArgs.toArray, sourcePaths.toArray, recordPhaseTiming)
+    }
+
+  /** Structured browser compile that relinks missing macro entry points. Resolves to a
+   *  compile result object aggregating the completed round's diagnostics.
+   */
+  def compileBrowserSessionWithRetainedMacroCompilerStructuredAsync(
+      setupArgs: js.Array[String],
+      sourcePaths: js.Array[String],
+      recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
+  ): js.Promise[js.Dynamic] =
+    js.async {
+      val collected = new js.Array[js.Dynamic]()
+      val onDiagnostic: js.Function1[js.Any, Unit] =
+        (diagnostic: js.Any) =>
+          collected.push(diagnostic.asInstanceOf[js.Dynamic])
+          ()
+      try
+        val exitCode =
+          runRetainedMacroSessionStructured(setupArgs.toArray, sourcePaths.toArray, recordPhaseTiming, onDiagnostic)
+        buildStructuredResultFromCollected(exitCode, collected)
+      catch
+        case ex: SessionSetupFailedException =>
+          sessionSetupFailedResult(ex)
+    }
+
   @JSExportTopLevel("runScala3SjsMacroSessionAsync")
   def runMacroSessionAsync(
       setupArgs: js.Array[String],
@@ -84,6 +139,34 @@ object MainJS extends JSDriver:
       recordPhaseTiming: js.Function2[String, Double, Unit],
   ): js.Promise[Int] =
     runBrowserSessionWithMacroLinkingAsync(setupArgs, sourcePaths, relink, maxRestarts, recordPhaseTiming)
+
+  @JSExportTopLevel("compileScala3SjsAsync")
+  def compileStructuredAsync(
+      setupArgs: js.Array[String],
+      sourcePaths: js.Array[String],
+  ): js.Promise[js.Dynamic] =
+    compileBrowserSessionStructuredAsync(setupArgs, sourcePaths, null)
+
+  @JSExportTopLevel("runScala3SjsMacroSessionStructuredAsync")
+  def runMacroSessionStructuredAsync(
+      setupArgs: js.Array[String],
+      sourcePaths: js.Array[String],
+      relink: js.Function1[js.Dynamic, js.Any],
+      maxRestarts: Int,
+      recordPhaseTiming: js.Function2[String, Double, Unit],
+      onDiagnostic: js.Function1[js.Any, Unit],
+  ): js.Promise[Int] =
+    js.async {
+      runBrowserSessionWithMacroLinkingStructuredImpl(
+        setupArgs.toArray,
+        sourcePaths.toArray,
+        relink,
+        maxRestarts,
+        recordPhaseTiming,
+        onDiagnostic,
+        restartIndex = 1,
+      )
+    }
 
   def clearRetainedMacroModules(): Unit =
     importedModuleNamespaces.clear()
@@ -154,6 +237,10 @@ object MainJS extends JSDriver:
       case ex: MissingMacroEntryPointException =>
         lastMissingMacroEntryPointsOrNull = ex
         MissingMacroEntryPointExitCode
+      case ex: SessionSetupFailedException =>
+        // Surfaced structurally by the structured entry points; converted to a
+        // js.JavaScriptException at the legacy boundary. Not an infrastructure error.
+        throw ex
       case jse: js.JavaScriptException =>
         logJavaScriptException(jse)
         throw jse
@@ -187,7 +274,32 @@ object MainJS extends JSDriver:
       progressCallback: ProgressCallback | Null,
   ): Int =
     def compile(): Int =
-      browserCompilerSession(setupArgs).compile(sourcePaths, progressCallback)
+      legacyBrowserCompilerSession(setupArgs).compile(sourcePaths, progressCallback)
+
+    progressCallback match
+      case null => compile()
+      case callback: PhaseTimingProgressCallback =>
+        callback.withCompilerRun(compile())
+      case _ =>
+        compile()
+
+  private def runBrowserSessionStructuredImpl(
+      setupArgs: Array[String],
+      sourcePaths: Array[String],
+      progressCallback: ProgressCallback | Null,
+      reporter: reporting.CollectingReporter,
+  ): Int =
+    withMissingMacroEntryPointHandling(progressCallback):
+      browserSessionStructuredResultWithProgress(setupArgs, sourcePaths, progressCallback, reporter)
+
+  private def browserSessionStructuredResultWithProgress(
+      setupArgs: Array[String],
+      sourcePaths: Array[String],
+      progressCallback: ProgressCallback | Null,
+      reporter: reporting.CollectingReporter,
+  ): Int =
+    def compile(): Int =
+      browserCompilerSession(setupArgs).compileStructured(sourcePaths, progressCallback, reporter)
 
     progressCallback match
       case null => compile()
@@ -197,32 +309,65 @@ object MainJS extends JSDriver:
         compile()
 
   private final class BrowserCompilerSession(setupArgs: Array[String]):
-    private val rootCtx = initCtx.fresh
-    rootCtx.base.retainPlatformBetweenRuns = true
+    private val rootCtx =
+      val ctx = initCtx.fresh
+      ctx.base.retainPlatformBetweenRuns = true
+      ctx.setReporter(new reporting.StoreReporter(null))
 
-    private val setupCtx: Context =
+    /** Diagnostics reported while distilling/checking the compiler flags. They are replayed
+     *  through each round's reporter so both console and structured paths observe them and
+     *  their counts include setup issues.
+     */
+    private val setupState: (Context, List[reporting.Diagnostic]) =
       setup(setupArgs, rootCtx, sourcesRequired = false) match
-        case Some((_, ctx)) => ctx
+        case Some((_, ctx)) =>
+          (ctx, rootCtx.reporter.removeBufferedMessages(using ctx))
         case None =>
-          throw js.JavaScriptException("failed to configure browser compiler session")
+          val stored = rootCtx.reporter.removeBufferedMessages(using rootCtx)
+          val converter = new reporting.CollectingReporter
+          stored.foreach(dia => converter.report(dia)(using rootCtx))
+          throw new SessionSetupFailedException(
+            converter.collectedDiagnostics,
+            converter.errorCount,
+            converter.warningCount,
+          )
+
+    private val setupCtx: Context = setupState._1
+    private val setupDiagnostics: List[reporting.Diagnostic] = setupState._2
 
     private val compiler = newCompiler(using setupCtx)
 
     def compile(sourcePaths: Array[String], progressCallback: ProgressCallback | Null): Int =
-      val compileCtx = freshRunContext(progressCallback)
+      val reporter = new reporting.ConsoleReporter()
+      val compileCtx = freshRunContext(reporter, progressCallback)
+      replaySetupDiagnostics(reporter)(using compileCtx)
       val files = sourcePaths.toList.map(compileCtx.getFile)
-      val reporter = doCompile(compiler, files)(using compileCtx)
-      if reporter.hasErrors then 1 else 0
+      val result = doCompile(compiler, files)(using compileCtx)
+      if result.hasErrors then 1 else 0
+
+    def compileStructured(
+        sourcePaths: Array[String],
+        progressCallback: ProgressCallback | Null,
+        reporter: reporting.CollectingReporter,
+    ): Int =
+      val compileCtx = freshRunContext(reporter, progressCallback)
+      replaySetupDiagnostics(reporter)(using compileCtx)
+      val files = sourcePaths.toList.map(compileCtx.getFile)
+      val result = doCompile(compiler, files)(using compileCtx)
+      if result.hasErrors then 1 else 0
 
     def emitMacroEntryPointsIR(packageNames: Seq[String]): Seq[MacroClassPathScanner.SerializedMacroEntryPointsIR] =
-      val emitCtx = freshRunContext(null)
+      val emitCtx = freshRunContext(new reporting.ConsoleReporter(), null)
       val run = compiler.newRun(using emitCtx)
       packageNames.toList.map(_.trim).filter(_.nonEmpty).distinct.flatMap { packageName =>
         MacroClassPathScanner.serializedMacroEntryPointsIRInPackage(packageName)(using run.runContext)
       }
 
-    private def freshRunContext(progressCallback: ProgressCallback | Null): Context =
-      val fresh = setupCtx.fresh.setReporter(new reporting.ConsoleReporter())
+    private def replaySetupDiagnostics(reporter: reporting.Reporter)(using Context): Unit =
+      setupDiagnostics.foreach(dia => reporter.report(dia))
+
+    private def freshRunContext(reporter: reporting.Reporter, progressCallback: ProgressCallback | Null): Context =
+      val fresh = setupCtx.fresh.setReporter(reporter)
       if progressCallback != null then fresh.setProgressCallback(progressCallback)
       fresh
 
@@ -233,6 +378,26 @@ object MainJS extends JSDriver:
         browserCompilerSessions.remove(browserCompilerSessions.head._1)
       new BrowserCompilerSession(setupArgs.clone())
     })
+
+  /** Acquire a session for the legacy (console) entry points, preserving their historical
+   *  failure behavior: a setup failure surfaces as `js.JavaScriptException`.
+   */
+  private def legacyBrowserCompilerSession(setupArgs: Array[String]): BrowserCompilerSession =
+    try browserCompilerSession(setupArgs)
+    catch
+      case _: SessionSetupFailedException =>
+        throw js.JavaScriptException("failed to configure browser compiler session")
+
+  /** Internal signal that a browser session could not be configured (`setup` returned
+   *  `None`). Carries the already-converted setup diagnostics so the structured entry
+   *  points can resolve with a result instead of rejecting.
+   */
+  private final class SessionSetupFailedException(
+      val diagnostics: js.Array[js.Dynamic],
+      val errorCount: Int,
+      val warningCount: Int,
+  ) extends RuntimeException("failed to configure browser compiler session")
+      with scala.util.control.NoStackTrace
 
   private def compilerSessionKey(args: Array[String]): String =
     args.map(arg => s"${arg.length}:$arg").mkString
@@ -319,7 +484,7 @@ object MainJS extends JSDriver:
         throw js.JavaScriptException("missing macro entry point interrupt did not record any entry points")
 
       val emittedEntryPointsIR = recordOptionalTiming(recordPhaseTiming, "macro entrypoint IR"):
-        browserCompilerSession(setupArgs).emitMacroEntryPointsIR(missing.packageNames)
+        legacyBrowserCompilerSession(setupArgs).emitMacroEntryPointsIR(missing.packageNames)
       val entryPointsIR =
         if emittedEntryPointsIR.nonEmpty then emittedEntryPointsIR
         else missing.entryPointsIR
@@ -340,6 +505,187 @@ object MainJS extends JSDriver:
           recordPhaseTiming,
           restartIndex,
         )
+
+  /** Structured twin of [[runBrowserSessionWithMacroLinkingImpl]]. Each round buffers its
+   *  diagnostics; a round interrupted by the macro relink (internal code 125) discards its
+   *  buffer (the relinked restart re-reports everything), while a round that completes
+   *  flushes its buffer through `onDiagnostic`. Setup diagnostics replay into every round,
+   *  so they survive a discard naturally.
+   */
+  private def runBrowserSessionWithMacroLinkingStructuredImpl(
+      setupArgs: Array[String],
+      sourcePaths: Array[String],
+      relink: js.Function1[js.Dynamic, js.Any],
+      remainingRestarts: Int,
+      recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
+      onDiagnostic: js.Function1[js.Any, Unit],
+      restartIndex: Int,
+  ): Int =
+    val reporter = new reporting.CollectingReporter
+    val code = runBrowserSessionStructuredImpl(
+      setupArgs,
+      sourcePaths,
+      phaseTimingProgressCallback(
+        recordPhaseTiming,
+        compilerRunName = s"compiler run $restartIndex",
+        compilerSetupName = s"compiler setup $restartIndex",
+      ),
+      reporter,
+    )
+    if code != MissingMacroEntryPointExitCode then
+      flushCollectedDiagnostics(reporter, onDiagnostic)
+      code
+    else if remainingRestarts <= 0 then
+      val missing = lastMissingMacroEntryPointsOrNull
+      val ids = if missing == null then "unknown macro entry points" else missing.ids.mkString(", ")
+      throw js.JavaScriptException(s"exceeded maximum Scala.js macro relink restarts while resolving $ids")
+    else
+      val missing = lastMissingMacroEntryPointsOrNull
+      if missing == null then
+        throw js.JavaScriptException("missing macro entry point interrupt did not record any entry points")
+
+      val emittedEntryPointsIR = recordOptionalTiming(recordPhaseTiming, "macro entrypoint IR"):
+        browserCompilerSession(setupArgs).emitMacroEntryPointsIR(missing.packageNames)
+      val entryPointsIR =
+        if emittedEntryPointsIR.nonEmpty then emittedEntryPointsIR
+        else missing.entryPointsIR
+      val request = js.Dynamic.literal(
+        protocolVersion = 1,
+        ids = missing.ids.toJSArray,
+        packageNames = missing.packageNames.toJSArray,
+        entryPointsIR = entryPointsIR.map(toJSMacroEntryPointsIR).toJSArray,
+      )
+      val linkedCompiler = linkedCompilerFromRelinkResult(awaitMaybePromise(relink(request)))
+      recordOptionalTiming(recordPhaseTiming, s"macro compiler restart $restartIndex"):
+        restartWithLinkedBrowserSessionCompilerStructured(
+          linkedCompiler,
+          setupArgs,
+          sourcePaths,
+          relink,
+          remainingRestarts - 1,
+          recordPhaseTiming,
+          onDiagnostic,
+          restartIndex,
+        )
+
+  /** Single-shot structured compile (no macro relinking). A macro interrupt yields exit
+   *  code 1 with the interrupted round's buffered diagnostics, or a synthesized error when
+   *  that buffer is empty; a setup failure yields a result rather than a rejection.
+   */
+  private def compileBrowserSessionStructuredImpl(
+      setupArgs: Array[String],
+      sourcePaths: Array[String],
+      recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
+  ): js.Dynamic =
+    val reporter = new reporting.CollectingReporter
+    try
+      val code = runBrowserSessionStructuredImpl(
+        setupArgs,
+        sourcePaths,
+        phaseTimingProgressCallback(recordPhaseTiming),
+        reporter,
+      )
+      if code == MissingMacroEntryPointExitCode then interruptedStructuredResult(reporter)
+      else structuredResult(code, reporter)
+    catch
+      case ex: SessionSetupFailedException =>
+        sessionSetupFailedResult(ex)
+
+  /** Drive the structured macro-relink session, preferring a retained linked compiler
+   *  module and falling back to a fresh local relink loop.
+   */
+  private def runRetainedMacroSessionStructured(
+      setupArgs: Array[String],
+      sourcePaths: Array[String],
+      recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
+      onDiagnostic: js.Function1[js.Any, Unit],
+  ): Int =
+    retainedMacroCompilerModule() match
+      case Some(module) if hasStructuredCompilerEntryPoint(module) =>
+        val run = module.selectDynamic(StructuredMacroSessionExport).asInstanceOf[StructuredMacroSessionFn]
+        js.await(run(
+          setupArgs.toJSArray,
+          sourcePaths.toJSArray,
+          browserMacroRelink,
+          DefaultMaxMacroLinkRestarts,
+          orNoopRecord(recordPhaseTiming),
+          onDiagnostic,
+        ))
+      case Some(module) =>
+        // Older module without the structured export: diagnostics are lost for this session.
+        val run = module.selectDynamic(MacroSessionExport).asInstanceOf[MacroSessionFn]
+        js.await(run(
+          setupArgs.toJSArray,
+          sourcePaths.toJSArray,
+          browserMacroRelink,
+          DefaultMaxMacroLinkRestarts,
+          orNoopRecord(recordPhaseTiming),
+        ))
+      case None =>
+        runBrowserSessionWithMacroLinkingStructuredImpl(
+          setupArgs,
+          sourcePaths,
+          browserMacroRelink,
+          DefaultMaxMacroLinkRestarts,
+          recordPhaseTiming,
+          onDiagnostic,
+          restartIndex = 1,
+        )
+
+  private def flushCollectedDiagnostics(
+      reporter: reporting.CollectingReporter,
+      onDiagnostic: js.Function1[js.Any, Unit],
+  ): Unit =
+    val diagnostics = reporter.collectedDiagnostics
+    var i = 0
+    while i < diagnostics.length do
+      onDiagnostic(diagnostics(i))
+      i += 1
+
+  private def structuredResult(exitCode: Int, reporter: reporting.CollectingReporter): js.Dynamic =
+    resultLiteral(exitCode, reporter.errorCount, reporter.warningCount, reporter.collectedDiagnostics)
+
+  private def interruptedStructuredResult(reporter: reporting.CollectingReporter): js.Dynamic =
+    val diagnostics = reporter.collectedDiagnostics
+    if diagnostics.length == 0 then
+      val missing = lastMissingMacroEntryPointsOrNull
+      val message =
+        val raw = if missing == null then null else missing.getMessage
+        if raw == null then "Scala.js macro entry point is not linked" else raw
+      diagnostics.push(reporting.JSDiagnostics.syntheticErrorDiagnostic(message))
+      resultLiteral(exitCode = 1, errorCount = 1, warningCount = 0, diagnostics)
+    else
+      resultLiteral(exitCode = 1, errorCount = reporter.errorCount, warningCount = reporter.warningCount, diagnostics)
+
+  private def sessionSetupFailedResult(ex: SessionSetupFailedException): js.Dynamic =
+    val exitCode = if ex.errorCount > 0 then 1 else 0
+    resultLiteral(exitCode, ex.errorCount, ex.warningCount, ex.diagnostics)
+
+  private def buildStructuredResultFromCollected(exitCode: Int, collected: js.Array[js.Dynamic]): js.Dynamic =
+    var errorCount = 0
+    var warningCount = 0
+    var i = 0
+    while i < collected.length do
+      collected(i).selectDynamic("severity").asInstanceOf[String] match
+        case "error"   => errorCount += 1
+        case "warning" => warningCount += 1
+        case _         => ()
+      i += 1
+    resultLiteral(exitCode, errorCount, warningCount, collected)
+
+  private def resultLiteral(
+      exitCode: Int,
+      errorCount: Int,
+      warningCount: Int,
+      diagnostics: js.Array[js.Dynamic],
+  ): js.Dynamic =
+    js.Dynamic.literal(
+      exitCode = exitCode,
+      hasErrors = exitCode == 1,
+      errorCount = errorCount,
+      warningCount = warningCount,
+      diagnostics = diagnostics,
+    )
 
   private def phaseTimingProgressCallback(
       recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
@@ -399,7 +745,13 @@ object MainJS extends JSDriver:
     importModule(url)
 
   private def hasCompilerEntryPoint(module: js.Dynamic): Boolean =
+    hasMacroSessionEntryPoint(module) || hasStructuredCompilerEntryPoint(module)
+
+  private def hasMacroSessionEntryPoint(module: js.Dynamic): Boolean =
     js.typeOf(module.selectDynamic(MacroSessionExport)) == "function"
+
+  private def hasStructuredCompilerEntryPoint(module: js.Dynamic): Boolean =
+    js.typeOf(module.selectDynamic(StructuredMacroSessionExport)) == "function"
 
   private def restartWithLinkedBrowserSessionCompiler(
       linkedCompiler: js.Dynamic,
@@ -417,17 +769,40 @@ object MainJS extends JSDriver:
     val record =
       if linkedRecordPhaseTiming != null then linkedRecordPhaseTiming.asInstanceOf[js.Function2[String, Double, Unit]]
       else ((_: String, _: Double) => ()).asInstanceOf[js.Function2[String, Double, Unit]]
-    val run = runValue.asInstanceOf[
-      js.Function5[
-        js.Array[String],
-        js.Array[String],
-        js.Function1[js.Dynamic, js.Any],
-        Int,
-        js.Function2[String, Double, Unit],
-        js.Promise[Int],
-      ]
-    ]
+    val run = runValue.asInstanceOf[MacroSessionFn]
     js.await(run(setupArgs.toJSArray, sourcePaths.toJSArray, relink, remainingRestarts, record))
+
+  /** Structured twin of [[restartWithLinkedBrowserSessionCompiler]]. Prefers the linked
+   *  module's structured export, forwarding `onDiagnostic`; if the module only exposes the
+   *  legacy export (an older module), falls back to it and loses structured diagnostics for
+   *  that restart.
+   */
+  private def restartWithLinkedBrowserSessionCompilerStructured(
+      linkedCompiler: js.Dynamic,
+      setupArgs: Array[String],
+      sourcePaths: Array[String],
+      relink: js.Function1[js.Dynamic, js.Any],
+      remainingRestarts: Int,
+      recordPhaseTiming: js.Function2[String, Double, Unit] | Null,
+      onDiagnostic: js.Function1[js.Any, Unit],
+      restartIndex: Int,
+  ): Int =
+    val record = orNoopRecord(linkedCompilerTimingRecorder(recordPhaseTiming, restartIndex + 1))
+    if hasStructuredCompilerEntryPoint(linkedCompiler) then
+      val run = linkedCompiler.selectDynamic(StructuredMacroSessionExport).asInstanceOf[StructuredMacroSessionFn]
+      js.await(run(setupArgs.toJSArray, sourcePaths.toJSArray, relink, remainingRestarts, record, onDiagnostic))
+    else
+      val runValue = linkedCompiler.selectDynamic(MacroSessionExport)
+      if js.typeOf(runValue) != "function" then
+        throw js.JavaScriptException(s"Scala.js macro relinker returned a module without $MacroSessionExport")
+      val run = runValue.asInstanceOf[MacroSessionFn]
+      js.await(run(setupArgs.toJSArray, sourcePaths.toJSArray, relink, remainingRestarts, record))
+
+  private def orNoopRecord(
+      record: js.Function2[String, Double, Unit] | Null,
+  ): js.Function2[String, Double, Unit] =
+    if record != null then record.asInstanceOf[js.Function2[String, Double, Unit]]
+    else ((_: String, _: Double) => ()).asInstanceOf[js.Function2[String, Double, Unit]]
 
   private def linkedCompilerTimingRecorder(
       recordPhaseTiming: js.Function2[String, Double, Unit] | Null,

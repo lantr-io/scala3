@@ -242,7 +242,7 @@ Call this before `createCompilerClient` and fall back when it returns `false`.
 ### `createCompilerClient(options): CompilerClient`
 
 Spawns the worker and returns a client. The worker starts loading immediately; wait
-on `ready` before calling `run`.
+on `ready` before calling `run` or `compile`.
 
 **Options**
 
@@ -261,14 +261,22 @@ on `ready` before calling `run`.
 Resolves once the compiler has loaded and is ready to run. Rejects if the worker
 fails to initialize.
 
-#### `run({ files, diagnostics? }): Promise<RunResult>`
+#### `run({ files, scalacOptions?, diagnostics? }): Promise<RunResult>`
 
-Compiles and runs the given sources. Only one run may be in flight at a time; calling
-`run` again before the previous run settles throws synchronously.
+Compiles and runs the given sources. At most one `run`-or-`compile` may be in flight at
+a time (they share a single slot); calling either before the previous one settles throws
+synchronously.
 
 - `files: { path: string, content: string }[]` — sources to compile. Paths are
   in-worker virtual paths, e.g. `"Main.scala"` or `"pkg/Foo.scala"`.
-- `diagnostics?: boolean` — when `true`, include compiler diagnostics in `output`.
+- `scalacOptions?: string[]` — extra compiler flags, e.g. `["-Wunused:all", "-explain"]`.
+  They are passed to the compiler **ahead of** the worker-managed `-classpath` and `-d`
+  arguments; because the compiler takes the last value on a conflict, those managed
+  arguments win and cannot be overridden.
+- `diagnostics?: boolean` — when `true`, turns on the compiler's verbose/profiling output,
+  which is surfaced as text in `output` and `compilerLog`. It does **not** control the
+  structured `diagnostics` array below — that is always populated. (See "The `Diagnostic`
+  shape" below.)
 
 Resolves with a `RunResult`:
 
@@ -276,6 +284,8 @@ Resolves with a `RunResult`:
 {
   ok: boolean;                 // true if compilation AND execution succeeded
   output: string;              // combined program / compiler output
+  diagnostics: Diagnostic[] | null;   // structured errors/warnings (may be empty; null
+                                      //   only from an older worker predating the field)
   compileDurationMs: number | null;   // total compile time for this run
   phases: { name: string, durationMs: number }[] | null; // per-phase timings
   compilerLog: string[] | null;       // raw compiler log lines
@@ -313,6 +323,80 @@ const result = await client.run({
   ],
 });
 // result.output === "Hello, Alice!\n"
+```
+
+#### `compile({ files, scalacOptions?, diagnostics? }): Promise<CompileResult>`
+
+Compiles the given sources **without** discovering an entry point, linking, or running
+them — for editor-style feedback, where you type-check the buffer and surface diagnostics
+as squiggles. It shares the single run-or-compile slot with `run`, so only one of the two
+can be in flight at a time (calling either while one is pending throws synchronously).
+
+- `files`, `scalacOptions?`, and `diagnostics?` behave exactly as they do for `run` above.
+  In particular `diagnostics?` only toggles verbose/profiling text in `compilerLog`; the
+  structured `diagnostics` array is always populated.
+
+Resolves with a `CompileResult`:
+
+```ts
+{
+  ok: boolean;                 // true if compilation succeeded (no errors)
+  exitCode: number;            // 0 on success, 1 when there are errors
+  diagnostics: Diagnostic[];   // structured errors/warnings (may be empty)
+  compilerLog: string[];       // raw compiler log lines
+  durationMs: number | null;   // total compile time
+  phases: { name: string, durationMs: number }[] | null; // per-phase timings
+}
+```
+
+Compilation **errors resolve** the promise with `ok: false` — they do not reject. The
+promise **rejects** for an invalid request (duplicate paths, paths containing `..`,
+non-`.scala` paths) or a fatal worker/infrastructure error (only the latter also fires
+`onError`).
+
+Diagnostic positions are **0-based**, which lines up directly with most editor APIs
+(CodeMirror, Monaco, …). A minimal "squiggles" integration:
+
+```js
+const { diagnostics } = await client.compile({
+  files: [{ path: "Main.scala", content: editor.getValue() }],
+});
+
+const markers = diagnostics.map((d) => ({
+  // 0-based line/column, straight from the diagnostic:
+  from: { line: d.line ?? 0, ch: d.column ?? 0 },
+  to:   { line: d.endLine ?? d.line ?? 0, ch: d.endColumn ?? d.column ?? 0 },
+  severity: d.severity, // "error" | "warning"
+  message: d.message,   // short text
+  tooltip: d.rendered,  // full snippet with caret
+}));
+// Hand `markers` to your editor's lint / decoration API.
+```
+
+`d.file` is the path exactly as you supplied it (e.g. `"Main.scala"`), so when you compile
+several files at once you can route each diagnostic to the correct open buffer.
+
+#### The `Diagnostic` shape
+
+Both `run` (in `RunResult.diagnostics`) and `compile` (in `CompileResult.diagnostics`)
+report diagnostics as plain objects. **All positions are 0-based**, and every field is
+always present — unavailable ones are `null`:
+
+```ts
+{
+  severity: "error" | "warning"; // info-level output is omitted here (it lands in compilerLog)
+  message: string;    // short message text, ANSI-stripped
+  rendered: string;   // full console-style rendering (source snippet + caret), ANSI-stripped
+  file: string | null;      // source path as you supplied it, or null
+  line: number | null;      // 0-based line of the diagnostic anchor (scalac's printed position)
+  column: number | null;    // 0-based column of the diagnostic anchor
+  endLine: number | null;   // 0-based line containing the span end
+  endColumn: number | null; // 0-based column just past the span end (exclusive)
+  offset: number | null;    // 0-based start character offset in the file
+  endOffset: number | null; // 0-based end character offset (exclusive)
+  code: string | null;      // diagnostic id, when known
+  name: string | null;      // diagnostic name / kind, when known
+}
 ```
 
 #### `importMacroArtifacts(files): Promise<MacroImportResult>`
