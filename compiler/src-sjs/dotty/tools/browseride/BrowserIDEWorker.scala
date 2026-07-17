@@ -896,8 +896,20 @@ object BrowserIDERunner:
       stripAnsi(if js.typeOf(value) == "string" then value.toString else js.JSON.stringify(value).toString)
 
     private def formatErrorForUser(value: js.Any): String =
-      try stripAnsi(value.asInstanceOf[js.Dynamic].selectDynamic("message").toString)
-      catch case NonFatal(_) => formatValue(value)
+      (value: Any) match
+        case error: Throwable =>
+          // Intentional user-facing failures are thrown as js.JavaScriptException
+          // carrying a string; a raw Throwable is an unhandled crash. Its JS-side
+          // view has no `message` property, so render it Scala-side.
+          stripAnsi(s"An unhandled exception was thrown in the compiler: $error")
+        case string: String =>
+          stripAnsi(string)
+        case _ =>
+          try
+            val message = value.asInstanceOf[js.Dynamic].selectDynamic("message")
+            if js.typeOf(message) == "string" then stripAnsi(message.toString)
+            else formatValue(value)
+          catch case NonFatal(_) => formatValue(value)
 
     private def post(messageType: String, fields: (String, js.Any)*): Unit =
       val message = js.Dynamic.literal()
