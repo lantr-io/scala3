@@ -1838,6 +1838,9 @@ object Build {
       Compile / unmanagedSourceDirectories   := Seq(baseDirectory.value / "src"),
       Compile / unmanagedSourceDirectories += (`tasty-core-bootstrapped` / baseDirectory).value / "src",
       Compile / unmanagedSourceDirectories += baseDirectory.value / "src-sjs",
+      // Local experiment: Scalus compiler plugin linked statically into the browser compiler
+      Compile / unmanagedSourceDirectories ++= Seq("scala", "scala-3.8", "shared/scala")
+        .map(d => baseDirectory.value / "src-scalus-plugin" / d),
       Compile / unmanagedResourceDirectories += baseDirectory.value / "resources",
       // Specify the default entry point of the compiler
       Compile / mainClass := Some("dotty.tools.dotc.MainJS"),
