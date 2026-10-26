@@ -59,6 +59,13 @@ object MainJS extends JSDriver:
       runImpl(args.toArray, null)
     }
 
+  // Local experiment: lets Node drive the retained browser compiler session.
+  @JSExportTopLevel("runScala3BrowserSessionAsync")
+  def runBrowserSessionForNodeAsync(setupArgs: js.Array[String], sourcePaths: js.Array[String]): js.Promise[Int] =
+    js.async {
+      runBrowserSessionImpl(setupArgs.toArray, sourcePaths.toArray, null)
+    }
+
   def runBrowserSessionWithPhaseTimingAsync(
       setupArgs: js.Array[String],
       sourcePaths: js.Array[String],

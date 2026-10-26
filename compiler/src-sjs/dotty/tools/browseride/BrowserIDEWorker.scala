@@ -522,9 +522,15 @@ object BrowserIDEWorker:
           disposeActiveSession()
           post("run-result", "ok" -> true, "output" -> sessionResult.output, "diagnostics" -> diagnostics.toJSArray)
 
+    // A module loaded from a blob URL cannot resolve bare npm specifiers, and import maps do
+    // not apply in workers. Point them at the pre-bundled copies served under ./npm-vendor/.
+    private def resolveNpmImports(jsCode: String): String =
+      val vendorBase = js.Dynamic.newInstance(js.Dynamic.global.URL)("./npm-vendor/", global.location.href).href.toString
+      jsCode.replaceAll("from \"(@noble/[^\"]+)\"", s"from \"$vendorBase$$1.js\"")
+
     private def loadLinkedRunner(jsCode: String): js.Promise[js.Dynamic] =
       js.async {
-        val moduleURL = BrowserJS.createModuleBlobURL(jsCode)
+        val moduleURL = BrowserJS.createModuleBlobURL(resolveNpmImports(jsCode))
         try
           val module = js.await(js.`import`[js.Dynamic](moduleURL))
           val runner = module.selectDynamic(RunnerExportName)

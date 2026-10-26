@@ -1,0 +1,167 @@
+package scalus.uplc
+import scala.language.unsafeNulls
+
+import scalus.uplc.builtin.{ByteString, Data}
+import scalus.serialization.flat.{listFlat, DecoderState, EncoderState, Flat, FlatDecodingError, given}
+
+import scala.collection.immutable.List
+
+sealed abstract class DefaultUni:
+    type Unlifted
+
+object DefaultUni:
+
+    trait Lift[A]:
+        def defaultUni: DefaultUni
+
+    sealed abstract class LiftedUni[A] extends DefaultUni with Lift[A]:
+        def defaultUni: DefaultUni = this
+
+    case object Integer extends LiftedUni[BigInt]
+    case object ByteString extends LiftedUni[ByteString]
+    case object String extends LiftedUni[String]
+    case object Unit extends LiftedUni[Unit]
+    case object Bool extends LiftedUni[Boolean]
+    case object BLS12_381_G1_Element extends DefaultUni
+    case object BLS12_381_G2_Element extends DefaultUni
+    case object BLS12_381_MlResult extends DefaultUni
+    case object Data extends DefaultUni:
+        type Unlifted = Data
+
+    case object ProtoList extends DefaultUni:
+        type Unlifted = Nothing // [A] =>> immutable.List[A]
+
+    case object ProtoPair extends DefaultUni:
+        type Unlifted = Nothing // [A, B] =>> (A, B)
+
+    case object ProtoArray extends DefaultUni:
+        type Unlifted = Nothing // [A] =>> Vector[A]
+
+    case object BuiltinValue extends DefaultUni:
+        type Unlifted = builtin.BuiltinValue
+
+    case class Apply(f: DefaultUni, arg: DefaultUni) extends DefaultUni:
+        type Unlifted = f.Unlifted => arg.Unlifted
+
+    def defaultUniFromValue[A: Lift](value: A): DefaultUni = summon[Lift[A]].defaultUni
+
+    given Lift[Int] with
+        def defaultUni: DefaultUni = DefaultUni.Integer
+
+    given Lift[Long] with
+        def defaultUni: DefaultUni = DefaultUni.Integer
+
+    given Lift[BigInt] = Integer
+    given Lift[ByteString] = ByteString
+    given Lift[String] = String
+    given Lift[Unit] = Unit
+    given Lift[Boolean] = Bool
+    given Lift[scalus.uplc.builtin.Data] with
+        def defaultUni: DefaultUni = DefaultUni.Data
+
+    given Lift[scalus.uplc.builtin.bls12_381.G1Element] with {
+        def defaultUni = BLS12_381_G1_Element
+    }
+    given Lift[scalus.uplc.builtin.bls12_381.G2Element] with {
+        def defaultUni = BLS12_381_G2_Element
+    }
+
+    def Pair(a: DefaultUni, b: DefaultUni): DefaultUni = Apply(Apply(ProtoPair, a), b)
+    def List(a: DefaultUni): DefaultUni = Apply(ProtoList, a)
+    def Array(a: DefaultUni): DefaultUni = Apply(ProtoArray, a)
+
+    def flatForUni(uni: DefaultUni)(using Flat[builtin.Data]): Flat[Any] =
+        uni match
+            case Integer    => summon[Flat[BigInt]].asInstanceOf[Flat[Any]]
+            case ByteString => summon[Flat[scalus.uplc.builtin.ByteString]].asInstanceOf[Flat[Any]]
+            case String     => summon[Flat[String]].asInstanceOf[Flat[Any]]
+            case Unit       => summon[Flat[Unit]].asInstanceOf[Flat[Any]]
+            case Bool       => summon[Flat[Boolean]].asInstanceOf[Flat[Any]]
+            case Data       => summon[Flat[builtin.Data]].asInstanceOf[Flat[Any]]
+            case Apply(ProtoList, a)  => listFlat(using flatForUni(a)).asInstanceOf[Flat[Any]]
+            case Apply(ProtoArray, a) =>
+                // Arrays use the same flat encoding as lists, converted to/from IndexedSeq
+                indexedSeqFlat(using flatForUni(a)).asInstanceOf[Flat[Any]]
+            case Apply(Apply(ProtoPair, a), b) =>
+                pairFlat(using flatForUni(a), flatForUni(b)).asInstanceOf[Flat[Any]]
+            case BuiltinValue         => builtinValueFlat.asInstanceOf[Flat[Any]]
+            case BLS12_381_G1_Element => blsStubFlat("bls12_381_G1_element")
+            case BLS12_381_G2_Element => blsStubFlat("bls12_381_G2_element")
+            case BLS12_381_MlResult   => blsStubFlat("bls12_381_MlResult")
+            // Reachable from untrusted bytes: `decodeUni` returns a bare `ProtoList`, `ProtoPair`
+            // or `ProtoArray` for tags 5, 6 and 12, and none of those names a constant type.
+            case _ => throw new FlatDecodingError(s"Unsupported uni: $uni")
+
+    /** Stub Flat instance for the BLS types, matching Haskell Plutus: the instance exists so that a
+      * container of them - an empty `List[G1Element]`, say - still has one, but no value of these
+      * types has a flat encoding.
+      *
+      * The two directions fail differently on purpose. Asking to encode one is a caller mistake,
+      * whereas a script claiming a BLS constant is malformed input rather than a defect, so
+      * decoding raises [[FlatDecodingError]] and callers report it as a bad script.
+      */
+    private def blsStubFlat(name: String): Flat[Any] =
+        new Flat[Any]:
+            private val message = s"$name has no flat encoding; use PrepareForSerialization"
+            def bitSize(a: Any): Int = throw new UnsupportedOperationException(message)
+            def encode(a: Any, encode: EncoderState): Unit =
+                throw new UnsupportedOperationException(message)
+            def decode(decode: DecoderState): Any = throw new FlatDecodingError(message)
+
+    // Flat instance for BuiltinValue - structural encoding matching Plutus `Flat Value`
+    // (PlutusCore/Value.hs): a list of (currency, list of (token, quantity)) in sorted key order,
+    // built from the existing list/pair/ByteString/Integer flat instances (audit finding F2).
+    private def builtinValueFlat: Flat[builtin.BuiltinValue] =
+        new Flat[builtin.BuiltinValue]:
+            type Entries = List[(builtin.ByteString, List[(builtin.ByteString, BigInt)])]
+            val entriesFlat = summon[Flat[Entries]]
+
+            def bitSize(a: builtin.BuiltinValue): Int =
+                entriesFlat.bitSize(builtin.BuiltinValue.toEntryList(a))
+
+            def encode(a: builtin.BuiltinValue, encoder: EncoderState): Unit =
+                entriesFlat.encode(builtin.BuiltinValue.toEntryList(a), encoder)
+
+            def decode(decoder: DecoderState): builtin.BuiltinValue =
+                builtin.BuiltinValue.fromCanonicalEntryList(entriesFlat.decode(decoder)) match
+                    case Right(value) => value
+                    case Left(reason) =>
+                        throw new FlatDecodingError(s"Invalid value constant: $reason")
+
+    def encodeUni(uni: DefaultUni): List[Int] =
+        uni match
+            case DefaultUni.Integer              => scala.List(0)
+            case DefaultUni.ByteString           => scala.List(1)
+            case DefaultUni.String               => scala.List(2)
+            case DefaultUni.Unit                 => scala.List(3)
+            case DefaultUni.Bool                 => scala.List(4)
+            case DefaultUni.ProtoList            => scala.List(5)
+            case DefaultUni.ProtoPair            => scala.List(6)
+            case DefaultUni.Apply(uniF, uniA)    => 7 :: encodeUni(uniF) ++ encodeUni(uniA)
+            case DefaultUni.Data                 => scala.List(8)
+            case DefaultUni.BLS12_381_G1_Element => scala.List(9)
+            case DefaultUni.BLS12_381_G2_Element => scala.List(10)
+            case DefaultUni.BLS12_381_MlResult   => scala.List(11)
+            case DefaultUni.ProtoArray           => scala.List(12)
+            case DefaultUni.BuiltinValue         => scala.List(13)
+
+    def decodeUni(state: List[Int]): (DefaultUni, List[Int]) =
+        state match
+            case 0 :: tail => (DefaultUni.Integer, tail)
+            case 1 :: tail => (DefaultUni.ByteString, tail)
+            case 2 :: tail => (DefaultUni.String, tail)
+            case 3 :: tail => (DefaultUni.Unit, tail)
+            case 4 :: tail => (DefaultUni.Bool, tail)
+            case 5 :: tail => (DefaultUni.ProtoList, tail)
+            case 6 :: tail => (DefaultUni.ProtoPair, tail)
+            case 7 :: tail =>
+                val (uniF, tail1) = decodeUni(tail)
+                val (uniA, tail2) = decodeUni(tail1)
+                (DefaultUni.Apply(uniF, uniA), tail2)
+            case 8 :: tail  => (DefaultUni.Data, tail)
+            case 9 :: tail  => (DefaultUni.BLS12_381_G1_Element, tail)
+            case 10 :: tail => (DefaultUni.BLS12_381_G2_Element, tail)
+            case 11 :: tail => (DefaultUni.BLS12_381_MlResult, tail)
+            case 12 :: tail => (DefaultUni.ProtoArray, tail)
+            case 13 :: tail => (DefaultUni.BuiltinValue, tail)
+            case _          => throw new FlatDecodingError(s"Invalid uni: $state")

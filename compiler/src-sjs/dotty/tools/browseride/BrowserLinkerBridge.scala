@@ -55,6 +55,11 @@ object BrowserLinkerBridge:
   def linkModuleAsync(irFiles: js.Array[IRInput]): js.Promise[js.Object] =
     moduleLinker.link(irFiles, Nil)
 
+  // Local experiment: lets Node drive the in-browser linker.
+  @scala.scalajs.js.annotation.JSExportTopLevel("linkScala3ModuleForNodeAsync")
+  def linkModuleForNodeAsync(paths: js.Array[String], contents: js.Array[Uint8Array]): js.Promise[js.Object] =
+    linkModuleAsync(paths.zip(contents).map((p, b) => irInput(p, b)))
+
   def linkCompilerModuleAsync(irFiles: js.Array[IRInput]): js.Promise[js.Object] =
     compilerModuleLinker.link(irFiles, Nil)
 

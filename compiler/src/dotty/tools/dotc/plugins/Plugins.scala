@@ -1,6 +1,7 @@
 package dotty.tools.dotc
 package plugins
 
+import dotty.tools.dotc.util.PlatformDependent.platformDependent
 import core.*
 import Contexts.*
 import Decorators.em
@@ -24,7 +25,10 @@ trait Plugins {
    *  test for same-named phases or other problems that are
    *  filtered from the final list of plugins.
    */
-  protected def loadRoughPluginsList(using Context): List[Plugin] = {
+  protected def loadRoughPluginsList(using Context): List[Plugin] =
+    platformDependent(loadPluginsFromPaths ++ StaticPlugins.all)(StaticPlugins.all)
+
+  private def loadPluginsFromPaths(using Context): List[Plugin] = {
     def asPath(p: String) = ClassPath.split(p)
     val paths  = ctx.settings.plugin.value
       .filter (_ != "")
