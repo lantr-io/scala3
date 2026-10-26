@@ -1,0 +1,7 @@
+{
+  "name": "scalus-noble-bundles",
+  "private": true,
+  "type": "module",
+  "description": "Self-contained ESM bundles of the @noble modules Scalus imports, versions as in scalus/package.json",
+  "dependencies": { "@noble/hashes": "1.8.0", "@noble/curves": "1.9.7", "esbuild": "0.25.10" }
+}

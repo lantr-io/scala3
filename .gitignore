@@ -23,6 +23,7 @@ local.sbt
 # npm
 node_modules
 compiler/browser-ide/assets/
+compiler/browser-ide/npm-vendor/
 
 # VS Code
 .vscode/

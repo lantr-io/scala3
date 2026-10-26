@@ -1,0 +1,48 @@
+name: Scalus browser toolchain
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["scalus-toolchain-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned Scalus commit
+        run: echo "SCALUS_REF=$(cat scalus/SCALUS_REF)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: scalus3/scalus
+          ref: ${{ env.SCALUS_REF }}
+          path: scalus-src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+      - uses: sbt/setup-sbt@v1
+      - name: Build toolchain
+        env:
+          SBT_OPTS: -Xss16m
+        run: scalus/build-toolchain.sh scalus-src scalus-toolchain.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scalus-toolchain
+          path: scalus-toolchain.tar.gz
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum scalus-toolchain.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" scalus-toolchain.tar.gz SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Scala 3 compiler on Scala.js/Wasm with the Scalus plugin. Scalus commit: $SCALUS_REF"
