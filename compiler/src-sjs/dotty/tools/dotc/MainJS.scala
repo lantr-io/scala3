@@ -59,6 +59,45 @@ object MainJS extends JSDriver:
       runImpl(args.toArray, null)
     }
 
+  // Build-time macro prelinking (scalus/prelink-macros.mjs): emits entry points for the given packages'
+  // macros, plus the implementation IR they need (drawn from `available`, i.e. classes the compiler
+  // does not already contain). Linked into the compiler, these expand without relinking in the
+  // browser. A macro whose implementation reaches a class in `jvmOnly` is left out: it cannot run
+  // in the browser anyway. Returns the IR files, and the ids of the macros left out.
+  @JSExportTopLevel("prelinkScala3MacroIRAsync")
+  def prelinkMacroIRAsync(
+      setupArgs: js.Array[String],
+      packageNames: js.Array[String],
+      availablePaths: js.Array[String],
+      availableContents: js.Array[scala.scalajs.js.typedarray.Uint8Array],
+      jvmOnly: js.Array[String],
+  ): js.Promise[js.Dynamic] =
+    js.async {
+      import dotty.tools.dotc.sjsmacros.host.{SjsMacroArtifacts, SjsMacroIRClosure}
+      val available = availablePaths.toSeq.zip(availableContents.toSeq)
+        .map((path, bytes) => SjsMacroArtifacts.IRFile(path, JSByteArrays.toByteArray(bytes)))
+      val availableByPath = available.map(f => f.path -> f).toMap
+      val blocked = jvmOnly.toSet
+      def closure(roots: Seq[SjsMacroArtifacts.IRFile]) = SjsMacroIRClosure.collect(roots, available)
+      def ownerIR(entry: MacroClassPathScanner.MacroEntryPoint) =
+        availableByPath.get(entry.implementationOwnerClassName.nameString.replace('.', '/') + ".sjsir")
+      val skipped = mutable.ArrayBuffer.empty[String]
+      val entryPoints = browserCompilerSession(setupArgs.toArray).inRun {
+        packageNames.toSeq.flatMap { pkg =>
+          val usable = MacroClassPathScanner.macroEntryPoints(pkg).filter { entry =>
+            val ok = ownerIR(entry).forall(owner => !closure(Seq(owner)).exists(f => blocked(f.path)))
+            if !ok then skipped += entry.id
+            ok
+          }
+          MacroClassPathScanner.serializedMacroEntryPointsIR(pkg, usable)
+        }
+      }.map(e => SjsMacroArtifacts.IRFile(e.path, e.bytes))
+      val files = (entryPoints ++ closure(entryPoints)).map { f =>
+        js.Dynamic.literal(path = f.path, bytes = JSByteArrays.toUint8Array(f.bytes))
+      }
+      js.Dynamic.literal(files = files.toJSArray, skipped = skipped.toJSArray)
+    }
+
   // Local experiment: lets Node drive the retained browser compiler session.
   @JSExportTopLevel("runScala3BrowserSessionAsync")
   def runBrowserSessionForNodeAsync(setupArgs: js.Array[String], sourcePaths: js.Array[String]): js.Promise[Int] =
@@ -362,6 +401,10 @@ object MainJS extends JSDriver:
       val files = sourcePaths.toList.map(compileCtx.getFile)
       val result = doCompile(compiler, files)(using compileCtx)
       if result.hasErrors then 1 else 0
+
+    def inRun[T](f: Context ?=> T): T =
+      val run = compiler.newRun(using freshRunContext(new reporting.ConsoleReporter(), null))
+      f(using run.runContext)
 
     def emitMacroEntryPointsIR(packageNames: Seq[String]): Seq[MacroClassPathScanner.SerializedMacroEntryPointsIR] =
       val emitCtx = freshRunContext(new reporting.ConsoleReporter(), null)

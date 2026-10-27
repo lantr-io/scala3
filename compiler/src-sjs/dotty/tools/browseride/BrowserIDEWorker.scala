@@ -163,7 +163,12 @@ object BrowserIDEWorker:
 
     private def initializeCompiler(): Unit =
       onComplete(ensureRuntime())(
-        _ => post("ready"),
+        runtime =>
+          post("ready")
+          // Fetch and unzip the runtime IR now, while the thread is mostly idle, instead of on the
+          // first link. Its result is memoized; failures surface again on that link.
+          ensureExecutionRuntime(runtime).`then`[Unit](_ => (), (_: Any) => ())
+          (),
         error => post("runtime-error", "error" -> formatErrorForUser(error)),
       )
 
@@ -631,16 +636,16 @@ object BrowserIDEWorker:
 
     private def readZippedIRFilesAsync(zipBytes: Uint8Array, pathPrefix: String = ""): js.Promise[Seq[BrowserLinkerBridge.IRInput]] =
       JSZip.loadAsync(zipBytes).`then`[Seq[BrowserLinkerBridge.IRInput]] { zip =>
-        zip.files.values
-          .filter(entry => !entry.dir && entry.name.endsWith(".sjsir"))
-          .toSeq
-          .sortBy(_.name)
-          .foldLeft(js.Promise.resolve(Seq.empty[BrowserLinkerBridge.IRInput])) { (collected, entry) =>
-            collected.`then`[Seq[BrowserLinkerBridge.IRInput]] { previous =>
-              entry.async("uint8array").`then`[Seq[BrowserLinkerBridge.IRInput]] { bytes =>
-                previous :+ BrowserLinkerBridge.irInput(s"$pathPrefix${entry.name}", bytes)
-              }
-            }
+        // Zipped IR (runtime, compiler, macro artifacts) never changes within a toolchain version,
+        // so it is versioned by path: no per-byte content hashing of ~75 MiB. Entries are
+        // decompressed concurrently and collected once (16k files).
+        val entries = zip.files.values.filter(entry => !entry.dir && entry.name.endsWith(".sjsir")).toSeq.sortBy(_.name)
+        js.Promise
+          .all(entries.map(_.async("uint8array")).toJSArray)
+          .`then`[Seq[BrowserLinkerBridge.IRInput]] { contents =>
+            entries.iterator.zip(contents.iterator).map { (entry, bytes) =>
+              BrowserLinkerBridge.immutableIRInput(s"$pathPrefix${entry.name}", bytes)
+            }.toVector
           }
       }
 
@@ -976,8 +981,11 @@ object BrowserIDERunner:
     val prefix = s"$OutputDir/"
     if file.startsWith(prefix) then file.stripPrefix(prefix) else file
 
+  // A source defining a macro implementation needs scala.quoted (Quotes, Expr). Matching `${` as
+  // well caught every string interpolation (s"...${x}"), sending ordinary programs down the
+  // macro-relinking path.
   private def mayDefineQuotedMacro(content: String): Boolean =
-    "\\$\\s*\\{".r.findFirstIn(content).nonEmpty || content.contains("scala.quoted")
+    content.contains("scala.quoted")
 
   private def qualifyName(packageName: String, name: String): String =
     if packageName.nonEmpty then s"$packageName.$name" else name

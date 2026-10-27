@@ -79,9 +79,8 @@ manifest["runtimeIR"] = [f"{prefix}scalus/{p.name}" for p in parts]
 
 # The compiler reads signatures from .tasty when a class has one, and linking uses the runtime IR
 # above. So classpath jars shrink to what compiling needs (76 -> 35 MiB for Scalus 1.4.1):
-# drop .class files of classes that have .tasty (Java classes keep theirs), and drop .sjsir, except
-# in the Scalus jar, which the playground also registers as the macro implementation artifact.
-MACRO_ARTIFACT = "scalus_sjs1_3-"
+# drop .class files of classes that have .tasty (Java classes keep theirs), and drop .sjsir. Scalus
+# macros are linked into the compiler (scalus/prelink-macros.mjs), so no jar serves as a macro artifact.
 
 
 def strip_jar(jar: pathlib.Path, keep_ir: bool) -> None:
@@ -106,7 +105,7 @@ def strip_jar(jar: pathlib.Path, keep_ir: bool) -> None:
 
 before = sum(p.stat().st_size for p in [*scalus_dir.glob("*.jar"), assets / "classpath" / "scala-lib.jar"])
 for j in jars:
-    strip_jar(scalus_dir / j, keep_ir=j.startswith(MACRO_ARTIFACT))
+    strip_jar(scalus_dir / j, keep_ir=False)
 strip_jar(assets / "classpath" / "scala-lib.jar", keep_ir=False)
 after = sum(p.stat().st_size for p in [*scalus_dir.glob("*.jar"), assets / "classpath" / "scala-lib.jar"])
 print(f"classpath jars stripped: {before / 2**20:.1f} -> {after / 2**20:.1f} MiB")

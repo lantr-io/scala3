@@ -25,7 +25,16 @@ echo "$cp_line" > "$work/classpath.txt"
 
 echo "== Compiler + browser IDE assets"
 (cd "$root/compiler" && npm ci --no-audit --no-fund)
+rm -rf "$root/compiler/scalus-macros-ir"
 (cd "$root" && sbt -Dsbt.supershell=false "scala3-compiler-sjs/prepareBrowserIDE")
+python3 -I "$root/scalus/assets.py" "$ide" "$work/classpath.txt"
+
+echo "== Prelink Scalus macros into the compiler"
+# The compiler just built emits the macro entry points; the second link includes them, so the
+# browser expands Scalus macros without relinking the compiler.
+node --experimental-wasm-exnref --experimental-wasm-jspi --experimental-wasm-imported-strings \
+  "$root/scalus/prelink-macros.mjs" "$ide/assets/compiler/main.js" "$ide" "$root/compiler/scalus-macros-ir"
+(cd "$root" && sbt -Dsbt.supershell=false "reload" "scala3-compiler-sjs/prepareBrowserIDE")
 python3 -I "$root/scalus/assets.py" "$ide" "$work/classpath.txt"
 "$root/scalus/noble/build.sh" "$ide/npm-vendor"
 

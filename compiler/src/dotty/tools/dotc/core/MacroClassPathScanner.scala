@@ -50,6 +50,18 @@ object MacroClassPathScanner:
       )
     }
 
+  /** The macros of a package, one entry each (build-time prelinking chooses which to link). */
+  def macroEntryPoints(packageName: String)(using Context): List[MacroEntryPoint] =
+    macroEntryPointsInPackage(packageName)
+
+  /** The entry-points class for the given subset of a package's macros. */
+  def serializedMacroEntryPointsIR(packageName: String, entries: List[MacroEntryPoint])(using Context): List[SerializedMacroEntryPointsIR] =
+    if entries.isEmpty then Nil
+    else
+      implicit val pos: Position = Position.NoPosition
+      val classDef = macroEntryPointsModuleClassDef(packageName, generatedClassName(packageName, "MacroEntryPoints$"), entries)
+      List(SerializedMacroEntryPointsIR(packageName, entryPointsIRPath(classDef.name.name), serializeClassDef(classDef)))
+
   private def implementationSymbolOf(symbol: TermSymbol)(using Context): Option[TermSymbol] =
     val body = Inlines.bodyToInline(symbol)
     if body.isEmpty then None
