@@ -2,6 +2,7 @@ package dotty.tools.io
 
 import scala.language.unsafeNulls
 import scala.scalajs.js
+import scala.scalajs.js.JSConverters.*
 import scala.scalajs.js.annotation.*
 import scala.scalajs.js.typedarray.Uint8Array
 import scala.scalajs.js.wasm.JSPI.allowOrphanJSAwait
@@ -155,24 +156,29 @@ final class FileZipArchive(jpath: JPath, release: Option[String]) extends ZipArc
       VersionedEntry(logicalName, entry, entryLastModified(entry))
     }.toList
 
+  // All entries are decompressed in one batch when the archive is indexed (package loading, early in
+  // a run), so reading an entry later never suspends. Suspending fails inside macro expansion, where
+  // JS frames sit on the stack, and a macro may load classes it needs from this archive.
+  private lazy val entryBytes: Map[String, Array[Byte]] =
+    val names = selectedEntries.map(_.zipEntry.name)
+    val contents = js.await(js.Promise.all(names.map(n => archiveHandle.file(n).nn.async("uint8array")).toJSArray))
+    names.iterator.zip(contents.iterator.map(JSByteArrays.toByteArray)).toMap
+
   private class LazyEntry(name: String, zipPath: String, time: Long, parent: DirEntry) extends Entry(name, parent):
     override def lastModified: Long = time
 
     override def input: InputStream =
-      val entry = archiveHandle.file(zipPath)
-      if entry == null then
-        throw new IOException(s"Missing zip entry: $zipPath in ${FileZipArchive.this.path}")
-      new ByteArrayInputStream(JSByteArrays.toByteArray(js.await(entry.async("uint8array"))))
+      val bytes = entryBytes.getOrElse(zipPath,
+        throw new IOException(s"Missing zip entry: $zipPath in ${FileZipArchive.this.path}"))
+      new ByteArrayInputStream(bytes)
 
-    override def sizeOption: Option[Int] =
-      val entry = archiveHandle.file(zipPath)
-      if entry == null then None
-      else Some(JSByteArrays.toByteArray(js.await(entry.async("uint8array"))).length)
+    override def sizeOption: Option[Int] = entryBytes.get(zipPath).map(_.length)
 
   lazy val (root, allDirs): (DirEntry, collection.Map[String, DirEntry]) =
     val root = new DirEntry("/", null)
     val dirs = mutable.HashMap[String, DirEntry]("/" -> root)
 
+    entryBytes // decompress now, while suspending is still possible
     for entry <- selectedEntries do
       val dir = getDir(dirs, entry.logicalName, isDir = false)
       val fileEntry = new LazyEntry(entry.logicalName, entry.zipEntry.name, entry.lastModified, dir)
