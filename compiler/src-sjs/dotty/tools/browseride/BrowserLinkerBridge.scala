@@ -30,7 +30,10 @@ object BrowserLinkerBridge:
   private val compilerModuleConfig = baseConfig
     .withExperimentalUseWebAssembly(true)
     .withESFeatures(_.withESVersion(ESVersion.ES2018))
-  private val moduleLinker = new LinkerSession(baseConfig)
+  // User programs skip the optimizer: linking a Scalus program got ~1/3 faster (first link and
+  // later ones), and the unoptimized code is fast enough for test programs. The compiler module,
+  // relinked for macros, keeps it.
+  private val moduleLinker = new LinkerSession(baseConfig.withOptimizer(false))
   private val compilerModuleLinker = new LinkerSession(compilerModuleConfig)
 
   trait IRInput extends js.Object:
