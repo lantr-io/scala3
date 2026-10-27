@@ -163,7 +163,12 @@ object BrowserIDEWorker:
 
     private def initializeCompiler(): Unit =
       onComplete(ensureRuntime())(
-        _ => post("ready"),
+        runtime =>
+          post("ready")
+          // Fetch and unzip the runtime IR now, while the thread is mostly idle, instead of on the
+          // first link. Its result is memoized; failures surface again on that link.
+          ensureExecutionRuntime(runtime).`then`[Unit](_ => (), (_: Any) => ())
+          (),
         error => post("runtime-error", "error" -> formatErrorForUser(error)),
       )
 
@@ -213,7 +218,7 @@ object BrowserIDEWorker:
           compilerIRFilesPromise.getOrElse {
             val loaded =
               compilerIRBytes().`then`[js.Array[BrowserLinkerBridge.IRInput]] { bytes =>
-                readZippedIRFilesAsync(bytes, "/compiler-ir/").`then`[js.Array[BrowserLinkerBridge.IRInput]](_.toJSArray)
+                readZippedIRFilesAsync(bytes, "/compiler-ir/", versionByPath = true).`then`[js.Array[BrowserLinkerBridge.IRInput]](_.toJSArray)
               }
             compilerIRFilesPromise = Some(loaded)
             loaded
@@ -605,21 +610,26 @@ object BrowserIDEWorker:
 
     private def loadZippedIRFiles(url: String, pathPrefix: String): js.Promise[Seq[BrowserLinkerBridge.IRInput]] =
       fetchBytes(url).`then`[Seq[BrowserLinkerBridge.IRInput]] { bytes =>
-        readZippedIRFilesAsync(bytes, pathPrefix)
+        readZippedIRFilesAsync(bytes, pathPrefix, versionByPath = true)
       }
 
-    private def readZippedIRFilesAsync(zipBytes: Uint8Array, pathPrefix: String = ""): js.Promise[Seq[BrowserLinkerBridge.IRInput]] =
+    // Toolchain IR (runtime, compiler) never changes for a given path, so it is versioned by path:
+    // no per-byte content hashing of ~75 MiB. Imported zips may change under the same path and keep
+    // content hashes. Entries are decompressed concurrently and collected once (16k files).
+    private def readZippedIRFilesAsync(
+        zipBytes: Uint8Array,
+        pathPrefix: String = "",
+        versionByPath: Boolean = false,
+    ): js.Promise[Seq[BrowserLinkerBridge.IRInput]] =
+      val irInput = if versionByPath then BrowserLinkerBridge.immutableIRInput else BrowserLinkerBridge.irInput
       JSZip.loadAsync(zipBytes).`then`[Seq[BrowserLinkerBridge.IRInput]] { zip =>
-        zip.files.values
-          .filter(entry => !entry.dir && entry.name.endsWith(".sjsir"))
-          .toSeq
-          .sortBy(_.name)
-          .foldLeft(js.Promise.resolve(Seq.empty[BrowserLinkerBridge.IRInput])) { (collected, entry) =>
-            collected.`then`[Seq[BrowserLinkerBridge.IRInput]] { previous =>
-              entry.async("uint8array").`then`[Seq[BrowserLinkerBridge.IRInput]] { bytes =>
-                previous :+ BrowserLinkerBridge.irInput(s"$pathPrefix${entry.name}", bytes)
-              }
-            }
+        val entries = zip.files.values.filter(entry => !entry.dir && entry.name.endsWith(".sjsir")).toSeq.sortBy(_.name)
+        js.Promise
+          .all(entries.map(_.async("uint8array")).toJSArray)
+          .`then`[Seq[BrowserLinkerBridge.IRInput]] { contents =>
+            entries.iterator.zip(contents.iterator).map { (entry, bytes) =>
+              irInput(s"$pathPrefix${entry.name}", bytes)
+            }.toVector
           }
       }
 

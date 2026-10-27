@@ -38,6 +38,15 @@ object BrowserLinkerBridge:
     val bytes: Uint8Array
     val versionHash: js.Array[Int]
 
+  /** IR whose bytes are fixed for a given path (toolchain zips), versioned by its path. */
+  def immutableIRInput(path: String, bytes: Uint8Array): IRInput =
+    val versionHash = path.getBytes(StandardCharsets.UTF_8).map(byte => byte.toInt & 0xff).toJSArray
+    js.Dynamic.literal(
+      path = path,
+      bytes = bytes,
+      versionHash = versionHash,
+    ).asInstanceOf[IRInput]
+
   def irInput(path: String, bytes: Uint8Array): IRInput =
     val versionHash = contentHash(bytes).map(byte => byte.toInt & 0xff).toJSArray
     js.Dynamic.literal(
