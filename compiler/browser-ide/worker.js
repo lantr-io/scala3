@@ -74,8 +74,9 @@ try {
   globalThis.__scala3CompilerSJSHostFS = fs.hostFS;
 
   postStatus("Loading compiler bundle...");
+  // No cache-busting query: the compiler finds its own module by URL (MainJS.currentModuleUrls) to
+  // look up linked-in macro entry points, and a different URL would load a second instance.
   const compilerModuleURL = new URL(manifest.compilerModule);
-  compilerModuleURL.searchParams.set("v", String(manifest.assetVersion ?? Date.now()));
   const compiler = await withTimeout(
     import(compilerModuleURL.href),
     COMPILER_LOAD_TIMEOUT_MS,
