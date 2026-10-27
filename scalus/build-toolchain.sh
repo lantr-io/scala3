@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Scalus browser toolchain: the Scala.js/Wasm compiler with the Scalus plugin linked in,
 # plus Scalus jars, runtime IR and @noble bundles, ready to serve as static files.
-# Usage: scalus/build-toolchain.sh <scalus checkout at scalus/SCALUS_REF> <output .tar.gz>
+# Usage: scalus/build-toolchain.sh <scalus checkout at scalus/SCALUS_REF (a tag, e.g. v1.4.1)> <output .tar.gz>
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 scalus="$(cd "$1" && pwd)"

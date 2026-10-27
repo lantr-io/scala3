@@ -76,6 +76,50 @@ for name, data in runtime_entries():
     out.writestr(name, data)
 out.close()
 manifest["runtimeIR"] = [f"{prefix}scalus/{p.name}" for p in parts]
+
+# The compiler reads signatures from .tasty when a class has one, and linking uses the runtime IR
+# above. So classpath jars shrink to what compiling needs (76 -> 35 MiB for Scalus 1.4.1):
+# drop .class files of classes that have .tasty (Java classes keep theirs), and drop .sjsir, except
+# in the Scalus jar, which the playground also registers as the macro implementation artifact.
+MACRO_ARTIFACT = "scalus_sjs1_3-"
+
+
+def strip_jar(jar: pathlib.Path, keep_ir: bool) -> None:
+    with zipfile.ZipFile(jar) as z:
+        names = z.namelist()
+        tasty_classes = {n[: -len(".tasty")] for n in names if n.endswith(".tasty")}
+
+        def keep(name: str) -> bool:
+            if name.endswith(".sjsir"):
+                return keep_ir
+            if name.endswith(".class"):
+                directory, _, file = name.rpartition("/")
+                top_level = (directory + "/" if directory else "") + file[: -len(".class")].split("$")[0]
+                return top_level not in tasty_classes
+            return True
+
+        entries = [(i, z.read(i)) for i in z.infolist() if keep(i.filename)]
+    with zipfile.ZipFile(jar, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as out:
+        for info, data in entries:
+            out.writestr(info.filename, data)
+
+
+before = sum(p.stat().st_size for p in [*scalus_dir.glob("*.jar"), assets / "classpath" / "scala-lib.jar"])
+for j in jars:
+    strip_jar(scalus_dir / j, keep_ir=j.startswith(MACRO_ARTIFACT))
+strip_jar(assets / "classpath" / "scala-lib.jar", keep_ir=False)
+after = sum(p.stat().st_size for p in [*scalus_dir.glob("*.jar"), assets / "classpath" / "scala-lib.jar"])
+print(f"classpath jars stripped: {before / 2**20:.1f} -> {after / 2**20:.1f} MiB")
+
+# File sizes by manifest URL, so a page can show download progress against a known total.
+manifest_dir = manifest_path.parent
+def size_of(url: str) -> int:
+    return (manifest_dir / url).stat().st_size
+compiler_wasm = str(pathlib.PurePosixPath(manifest["compilerModule"]).parent / "main.wasm")
+sized = [e["url"] for e in manifest["classpath"]] + manifest["runtimeIR"] + [manifest["compilerIR"], compiler_wasm]
+manifest["sizes"] = {u: size_of(u) for u in sized}
+manifest_path.write_text(json.dumps(manifest, indent=2))
+print(f"download total: {sum(manifest['sizes'].values()) / 2**20:.1f} MiB")
 # @noble bundles (scalus/noble/build.sh); the worker rewrites bare imports to this location.
 manifest["npmVendor"] = "./npm-vendor/" if prefix == "./assets/" else "../npm-vendor/"
 manifest_path.write_text(json.dumps(manifest, indent=2))
