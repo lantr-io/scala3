@@ -108,3 +108,4 @@ scaladoc/output/
 # only used in local development
 .enable_bsp_all_projects
 compiler/scalus-macros-ir/
+compiler/src-scalus-plugin/

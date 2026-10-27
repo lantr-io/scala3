@@ -1,7 +1,8 @@
 """Copy the Scalus compiler plugin sources into compiler/src-scalus-plugin and patch them for Scala.js.
 
 The plugin is linked statically into the Scala.js/Wasm compiler (see StaticPlugins), so its sources
-are compiled with the compiler. Run after changing scalus/SCALUS_REF.
+are compiled with the compiler. build-toolchain.sh runs this on every build, from the Scalus checkout
+at scalus/SCALUS_REF; compiler/src-scalus-plugin is generated, not committed.
 Usage: python3 -I scalus/sync-plugin.py <scalus checkout>   (run `sbt scalusPlugin/copySharedFiles` there first)
 """
 import pathlib

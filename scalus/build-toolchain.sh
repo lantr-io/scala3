@@ -10,8 +10,10 @@ ide="$root/compiler/browser-ide"
 work="$(mktemp -d)"
 
 echo "== Scalus JS jars and classpath ($(git -C "$scalus" rev-parse --short HEAD))"
-# scalus-cardano-ledger brings TxBuilder; its classpath includes scalus-core.
-(cd "$scalus" && sbt -Dsbt.supershell=false scalusJS/packageBin scalusCardanoLedgerJS/packageBin)
+# scalus-cardano-ledger brings TxBuilder; its classpath includes scalus-core. copySharedFiles fills
+# the plugin's shared sources, which sync-plugin.py copies into the compiler below.
+(cd "$scalus" && sbt -Dsbt.supershell=false scalusPlugin/copySharedFiles scalusJS/packageBin scalusCardanoLedgerJS/packageBin)
+python3 -I "$root/scalus/sync-plugin.py" "$scalus"
 # -batch -no-colors keeps terminal escape codes out of the output; pick the classpath line itself.
 cp_line="$(cd "$scalus" && sbt -batch -no-colors -Dsbt.supershell=false --error \
   "export scalusCardanoLedgerJS/Runtime/fullClasspath" | grep '/scalus-core/js/target/' | tail -1)"

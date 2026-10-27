@@ -1,0 +1,48 @@
+name: Bump Scalus
+
+# Moves the toolchain to another Scalus version and releases it:
+# commits scalus/SCALUS_REF, tags the toolchain, and runs the toolchain workflow on that tag
+# (build, release, Pages). The playground then needs its TOOLCHAIN_VERSION set to the new tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scalus_ref:
+        description: "Scalus git tag to build against, e.g. v1.4.2"
+        required: true
+      toolchain_tag:
+        description: "Toolchain release tag to create, e.g. scalus-toolchain-v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: scalus-wasm
+      - name: Check the Scalus tag exists
+        run: git ls-remote --exit-code --tags https://github.com/scalus3/scalus.git "refs/tags/${{ inputs.scalus_ref }}"
+      - name: Commit SCALUS_REF and tag the toolchain
+        env:
+          SCALUS_REF: ${{ inputs.scalus_ref }}
+          TAG: ${{ inputs.toolchain_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "$SCALUS_REF" > scalus/SCALUS_REF
+          if ! git diff --quiet; then
+            git commit -am "Build the toolchain against Scalus $SCALUS_REF"
+            git push origin scalus-wasm
+          fi
+          git tag -a "$TAG" -m "Scalus browser toolchain $TAG (Scalus $SCALUS_REF)"
+          git push origin "$TAG"
+      - name: Build and release the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Pushes made with this token start no workflows, so start the toolchain build explicitly.
+        run: gh workflow run scalus-toolchain.yaml --ref "${{ inputs.toolchain_tag }}"
