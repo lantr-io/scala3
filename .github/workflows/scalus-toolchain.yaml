@@ -23,6 +23,8 @@ jobs:
           repository: scalus3/scalus
           ref: ${{ env.SCALUS_REF }}
           path: scalus-src
+          # Full history with tags: sbt-dynver derives the Scalus version (e.g. 1.4.1) from them.
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
