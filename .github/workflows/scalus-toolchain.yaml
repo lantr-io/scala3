@@ -48,3 +48,44 @@ jobs:
           gh release create "$GITHUB_REF_NAME" scalus-toolchain.tar.gz SHA256SUMS \
             --title "$GITHUB_REF_NAME" \
             --notes "Scala 3 compiler on Scala.js/Wasm with the Scalus plugin. Scalus commit: $SCALUS_REF"
+
+  # Serves the newest toolchain releases from GitHub Pages, which sends CORS headers (release
+  # downloads do not), at https://lantr-io.github.io/scala3/toolchain/<tag>/browser-ide/.
+  # Each deploy replaces the whole site, so it is rebuilt from the releases; older versions stay.
+  pages:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - name: Assemble the site from the 3 newest toolchain releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p site/toolchain
+          touch site/.nojekyll
+          tags=$(gh release list -R "$REPO" --limit 50 --json tagName \
+            --jq '[.[].tagName | select(startswith("scalus-toolchain-v"))][:3][]')
+          echo '<!doctype html><title>Scalus browser toolchain</title><h1>Scalus browser toolchain</h1><ul>' > site/index.html
+          for tag in $tags; do
+            mkdir -p "site/toolchain/$tag"
+            gh release download "$tag" -R "$REPO" -p scalus-toolchain.tar.gz -O - | tar -xz -C "site/toolchain/$tag"
+            echo "<li><code>toolchain/$tag/browser-ide/</code></li>" >> site/index.html
+          done
+          echo '</ul><p>Used by <a href="https://play.scalus.org">play.scalus.org</a>.</p>' >> site/index.html
+          du -sh site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
