@@ -363,7 +363,7 @@ extends ImplicitRunInfo, ConstraintRunInfo, cc.CaptureRunInfo {
     val runCtx = ctx.fresh
     runCtx.setProfiler(Profiler())
 
-    val pluginPlan = platformDependent(ctx.base.addPluginPhases(ctx.base.phasePlan))(ctx.base.phasePlan)
+    val pluginPlan = ctx.base.addPluginPhases(ctx.base.phasePlan)
     val phases = ctx.base.fusePhases(pluginPlan,
       ctx.settings.Yskip.value, ctx.settings.YstopBefore.value, stopAfter, ctx.settings.Ycheck.value)
     ctx.base.usePhases(phases, runCtx)
