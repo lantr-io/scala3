@@ -184,7 +184,13 @@ object BrowserIDEWorker:
 
     private def ensureExecutionRuntime(runtime: Runtime): js.Promise[Seq[BrowserLinkerBridge.IRInput]] =
       executionRuntimePromise.getOrElse {
-        val initialized = loadZippedIRFiles(runtime.manifest.selectDynamic("runtimeIR").toString, "/runtime/")
+        // runtimeIR is one zip URL, or a list of them (split to stay under per-file host limits).
+        val urls = runtime.manifest.selectDynamic("runtimeIR") match
+          case parts if js.Array.isArray(parts) => parts.asInstanceOf[js.Array[String]].toSeq
+          case single                           => Seq(single.toString)
+        val initialized = js.Promise
+          .all(urls.map(url => loadZippedIRFiles(url, "/runtime/")).toJSArray)
+          .`then`[Seq[BrowserLinkerBridge.IRInput]](_.toSeq.flatten)
         executionRuntimePromise = Some(initialized)
         initialized
       }
@@ -523,10 +529,19 @@ object BrowserIDEWorker:
           post("run-result", "ok" -> true, "output" -> sessionResult.output, "diagnostics" -> diagnostics.toJSArray)
 
     // A module loaded from a blob URL cannot resolve bare npm specifiers, and import maps do
-    // not apply in workers. Point them at the pre-bundled copies served under ./npm-vendor/.
+    // not apply in workers. Point them at the bundles and stubs the manifest locates
+    // (npmVendor), or at ./npm-vendor/ next to the worker for manifests without it.
     private def resolveNpmImports(jsCode: String): String =
-      val vendorBase = js.Dynamic.newInstance(js.Dynamic.global.URL)("./npm-vendor/", global.location.href).href.toString
-      jsCode.replaceAll("from \"(@noble/[^\"]+)\"", s"from \"$vendorBase$$1.js\"")
+      val fromManifest = config.manifest.selectDynamic("npmVendor")
+      val vendorBase =
+        if js.typeOf(fromManifest) == "string" then fromManifest.toString
+        else js.Dynamic.newInstance(js.Dynamic.global.URL)("./npm-vendor/", global.location.href).href.toString
+      // Only `import ... from "<bare specifier>"` statements at line start: string literals in the
+      // program can contain `from "` too. Bare = not relative, not absolute, not a URL.
+      jsCode.replaceAll(
+        "(?m)^(import\\s[^;\\n]*?\\sfrom\\s)\"((?![./])[^\":]+)\"",
+        s"$$1\"$vendorBase$$2.js\"",
+      )
 
     private def loadLinkedRunner(jsCode: String): js.Promise[js.Dynamic] =
       js.async {

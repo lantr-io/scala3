@@ -58,7 +58,9 @@ try {
   const absolutize = (value) => new URL(value, manifestUrl).href;
   manifest.compilerModule = absolutize(manifest.compilerModule);
   manifest.compilerIR = absolutize(manifest.compilerIR);
-  manifest.runtimeIR = absolutize(manifest.runtimeIR);
+  manifest.runtimeIR = Array.isArray(manifest.runtimeIR)
+    ? manifest.runtimeIR.map(absolutize)
+    : absolutize(manifest.runtimeIR);
   if (Array.isArray(manifest.classpath)) {
     for (const entry of manifest.classpath) {
       if (entry && typeof entry.url === "string") {
@@ -68,6 +70,9 @@ try {
   }
   if (typeof manifest.jszipWrapper === "string") {
     manifest.jszipWrapper = absolutize(manifest.jszipWrapper);
+  }
+  if (typeof manifest.npmVendor === "string") {
+    manifest.npmVendor = absolutize(manifest.npmVendor);
   }
 
   const fs = createMemoryFileSystem();

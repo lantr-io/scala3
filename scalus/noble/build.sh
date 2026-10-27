@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bundle each @noble module Scalus imports into one self-contained ESM file under <out>/@noble/...
-# The in-browser runner rewrites `from "@noble/x/y"` to these files (workers have no import maps).
+# Write the npm modules linked Scalus programs import, as self-contained ESM files under <out>:
+# bundles of the @noble modules, and stubs for modules only Scalus's npm facade uses.
+# The in-browser runner rewrites `from "pkg/x"` to <out>/pkg/x.js (workers have no import maps).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 out="$1"
@@ -14,3 +15,4 @@ for m in @noble/curves/bls12-381 @noble/curves/ed25519 @noble/curves/secp256k1 \
   echo "export * from '$m';" > "$entry"
   npx esbuild "$entry" --bundle --format=esm --log-level=warning --outfile="$out/$m.js"
 done
+cp -R "$here/stubs/." "$out/"
