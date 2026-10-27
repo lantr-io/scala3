@@ -11,7 +11,10 @@ work="$(mktemp -d)"
 
 echo "== Scalus JS jar and classpath ($(git -C "$scalus" rev-parse --short HEAD))"
 (cd "$scalus" && sbt -Dsbt.supershell=false scalusJS/packageBin)
-cp_line="$(cd "$scalus" && sbt -Dsbt.supershell=false --error "export scalusJS/Runtime/fullClasspath" | tail -1)"
+# -batch -no-colors keeps terminal escape codes out of the output; pick the classpath line itself.
+cp_line="$(cd "$scalus" && sbt -batch -no-colors -Dsbt.supershell=false --error \
+  "export scalusJS/Runtime/fullClasspath" | grep '/scalus-core/js/target/' | tail -1)"
+[[ -n "$cp_line" ]] || { echo "Could not read the Scalus JS classpath" >&2; exit 1; }
 jar="$(ls "$scalus"/scalus-core/js/target/scala-3*/scalus_sjs1_3-*.jar | head -1)"
 classes="$(dirname "$jar")/classes"
 echo "${cp_line//$classes/$jar}" > "$work/classpath.txt"
