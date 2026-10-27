@@ -955,8 +955,11 @@ object BrowserIDERunner:
     val prefix = s"$OutputDir/"
     if file.startsWith(prefix) then file.stripPrefix(prefix) else file
 
+  // A source defining a macro implementation needs scala.quoted (Quotes, Expr). Matching `${` as
+  // well caught every string interpolation (s"...${x}"), sending ordinary programs down the
+  // macro-relinking path.
   private def mayDefineQuotedMacro(content: String): Boolean =
-    "\\$\\s*\\{".r.findFirstIn(content).nonEmpty || content.contains("scala.quoted")
+    content.contains("scala.quoted")
 
   private def qualifyName(packageName: String, name: String): String =
     if packageName.nonEmpty then s"$packageName.$name" else name
