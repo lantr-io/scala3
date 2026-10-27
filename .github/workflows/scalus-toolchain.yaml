@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     tags: ["scalus-toolchain-v*"]
+    branches: [scalus-wasm]
+    paths: ["scalus/**", ".github/workflows/scalus-toolchain.yaml"]
 
 permissions:
   contents: write
